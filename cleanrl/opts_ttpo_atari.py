@@ -3,6 +3,7 @@
 import os
 import random
 import time
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -428,34 +429,11 @@ def select_next_action(
     exploration = torch.sqrt(torch.log(torch.tensor(N_total + 1, dtype=torch.float32, device=adv.device))) / N_subtree
     tuct = exploitation * exploration
 
-    # === TUCT Aggregation（注释 if 分支并取消注释 else 分支可恢复原版）===
-    if parent_indices is not None and children_indices is not None:
-        # Aggregate TUCT for identical state-action pairs (skip done=True)
-        aggregated_tuct = {}
-        for idx in range(current_step + 1):
-            if done_mask[idx]:
-                continue
-            parent = int(parent_indices[idx, env_idx].item())
-            if parent != -1:
-                representative = children_indices[parent][env_idx][0]
-            else:
-                current_tid = int(tid_values[idx].item())
-                for s in range(current_step + 1):
-                    if (int(parent_indices[s, env_idx].item()) == -1 and
-                        int(tid_values[s].item()) == current_tid):
-                        representative = s
-                        break
-            if representative not in aggregated_tuct:
-                aggregated_tuct[representative] = 0.0
-            aggregated_tuct[representative] += tuct[idx].item()
-        best_action_idx = max(aggregated_tuct, key=aggregated_tuct.get)
-        best_tuct = aggregated_tuct[best_action_idx]
-    else:
-        tuct[done_mask] = float('-inf')
-        best_action_idx = tuct.argmax().item()
-        best_tuct = tuct[best_action_idx].item()
+    tuct[done_mask] = float('-inf')
+    best_action_idx = tuct.argmax().item()
+    best_tuct = tuct[best_action_idx].item()
 
-    root_tuct_value = max(adv.mean().item(), root_tuct)
+    root_tuct_value = max(adv.abs().mean().item(), root_tuct)
 
     if root_tuct_value > best_tuct:
         return -1
@@ -534,6 +512,9 @@ if __name__ == "__main__":
     next_done = torch.zeros(args.num_envs).to(device)
 
     for iteration in range(1, args.num_iterations + 1):
+        # Initialize episodic_returns for this iteration
+        episodic_returns = []
+        
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
@@ -614,6 +595,7 @@ if __name__ == "__main__":
                     # Extract scalar value from array if needed
                     episodic_return = float(ep_r[0] if hasattr(ep_r, '__getitem__') else ep_r)
                     episodic_length = int(ep_l[0] if hasattr(ep_l, '__getitem__') else ep_l)
+                    episodic_returns.append(episodic_return)
                     print(f"global_step={global_step}, episodic_return={episodic_return}")
                     writer.add_scalar("charts/episodic_return", episodic_return, global_step)
                     writer.add_scalar("charts/episodic_length", episodic_length, global_step)
@@ -719,6 +701,18 @@ if __name__ == "__main__":
             for env_idx in range(args.num_envs):
                 if not next_done_list[env_idx]:
                     current_parent[env_idx] = step
+
+        # Calculate mean episodic return and save to file
+        if episodic_returns:
+            mean_episodic_return = sum(episodic_returns) / len(episodic_returns)
+            # Create results directory if it doesn't exist
+            os.makedirs("./results", exist_ok=True)
+            # Generate filename: {task}_{算法名}_{日期}.txt
+            date_str = datetime.now().strftime("%Y%m%d")
+            filename = f"./results/{args.env_id}_{args.exp_name}_{date_str}_{args.seed}.txt"
+            # Append mean episodic return to file (one value per line)
+            with open(filename, "a") as f:
+                f.write(f"{mean_episodic_return}\n")
 
         # Bootstrap value for non-terminal leaf nodes and recompute advantages
         with torch.no_grad():
