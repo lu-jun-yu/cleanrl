@@ -255,24 +255,32 @@ for step in range(num_steps):
 
 ### 5.2 TreeGAE
 
-从终止节点回溯到 root，更新优势估计。
+从终止节点回溯到 root，更新优势估计，并同步相同状态-动作对的优势。
 
 ```
 V_next 的计算：
     若无子节点且 dones[t] = True：V_next = 0（终止）
     若无子节点且 dones[t] = False：V_next = bootstrap_value（未终止叶节点）
-    若有子节点：V_next = mean(children 的 values)
+    若有子节点：V_next = values[children[0]]
 
 δ_t = rewards[t] + γ * V_next - values[t]
 
-对于终止节点或叶节点（无子节点）：
-    A_t = δ_t
+优势计算（同步后 children 优势相同，直接用第一个）：
+    若无子节点：current_adv = δ_t
+    若有子节点：current_adv = δ_t + γ * λ * A_children[0]
 
-对于非分支节点（1 个子节点）：
-    A_t = δ_t + γ * λ * A_child
+优势同步（相同状态-动作对应有相同优势）：
+    中间节点（parent != -1）：
+        siblings = children_indices[parent]
+        n = len(siblings)
+        new_avg = (old_avg * (n-1) + current_adv) / n
+        广播 new_avg 到所有 siblings
 
-对于分支节点（多个子节点）：
-    A_t = δ_t + γ * λ * mean(所有子节点的 A)
+    开头节点（parent == -1）：
+        找所有 parent=-1 且 tid 相同的节点
+        n = len(first_layer_siblings)
+        new_avg = (old_avg * (n-1) + current_adv) / n
+        广播 new_avg 到所有 first_layer_siblings
 ```
 
 ### 5.3 TUCT（Tree UCT）

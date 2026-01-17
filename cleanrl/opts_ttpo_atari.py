@@ -249,12 +249,14 @@ def compute_tree_gae(
     parent_indices: torch.Tensor,
     children_indices: List[List[List[int]]],
     advantages: torch.Tensor,
+    tid: torch.Tensor,
     gamma: float,
     gae_lambda: float,
     next_value: float = 0.0,
 ):
     """
     Compute TreeGAE advantages from terminal node back to root.
+    Synchronizes advantages for identical state-action pairs.
 
     Args:
         terminal_step: The step index of the terminal node
@@ -262,10 +264,10 @@ def compute_tree_gae(
         rewards, values, dones, parent_indices: Tree data tensors
         children_indices: List of children indices for each node
         advantages: Tensor to store computed advantages (modified in-place)
+        tid: Trajectory ID for each node
         gamma, gae_lambda: GAE parameters
         next_value: Bootstrap value for non-terminal leaf nodes
     """
-    # Backtrack from terminal node to root
     current = terminal_step
 
     while True:
@@ -277,27 +279,38 @@ def compute_tree_gae(
         if len(children) == 0:
             V_next = 0.0 if dones[current, env_idx] else next_value
         else:
-            V_next = torch.stack([values[child, env_idx] for child in children]).mean()
+            V_next = values[children[0], env_idx]
 
-        # Compute delta
+        # Compute delta and advantage
         delta = rewards[current, env_idx] + gamma * V_next - V_current
-
-        # Get children advantages
         if len(children) == 0:
-            # Terminal node or leaf node
-            advantages[current, env_idx] = delta
-        elif len(children) == 1:
-            # Non-branch node
-            child_adv = advantages[children[0], env_idx]
-            advantages[current, env_idx] = delta + gamma * gae_lambda * child_adv
+            current_adv = delta
         else:
-            # Branch node
-            child_advs = torch.stack([advantages[child, env_idx] for child in children])
-            mean_child_adv = child_advs.mean()
-            advantages[current, env_idx] = delta + gamma * gae_lambda * mean_child_adv
+            current_adv = delta + gamma * gae_lambda * advantages[children[0], env_idx]
+
+        # Sync advantages for identical state-action pairs
+        parent = parent_indices[current, env_idx].item()
+        if parent != -1:
+            siblings = children_indices[parent][env_idx]
+            n = len(siblings)
+            old_avg = advantages[siblings[0], env_idx]
+            new_avg = (old_avg * (n - 1) + current_adv) / n
+            for s in siblings:
+                advantages[s, env_idx] = new_avg
+        else:
+            current_tid = int(tid[current, env_idx].item())
+            first_layer_siblings = []
+            for s in range(terminal_step + 1):
+                if (parent_indices[s, env_idx].item() == -1 and
+                    int(tid[s, env_idx].item()) == current_tid):
+                    first_layer_siblings.append(s)
+            n = len(first_layer_siblings)
+            old_avg = advantages[first_layer_siblings[0], env_idx]
+            new_avg = (old_avg * (n - 1) + current_adv) / n
+            for s in first_layer_siblings:
+                advantages[s, env_idx] = new_avg
 
         # Move to parent
-        parent = parent_indices[current, env_idx].item()
         if parent == -1:
             break
         current = parent
@@ -373,6 +386,8 @@ def select_next_action(
     tree_branches: Dict[int, int],
     N_total: int,
     root_tuct: float,
+    parent_indices: torch.Tensor = None,  # 聚合参数（注释调用处可恢复原版）
+    children_indices: List[List[List[int]]] = None,  # 聚合参数（注释调用处可恢复原版）
 ) -> int:
     """
     Select the action with highest TUCT value using vectorized operations.
@@ -411,8 +426,29 @@ def select_next_action(
     exploration = torch.sqrt(torch.log(torch.tensor(N_total + 1, dtype=torch.float32, device=adv.device))) / N_subtree
     tuct = exploitation * exploration
 
-    best_action_idx = tuct.argmax().item()
-    best_tuct = tuct[best_action_idx].item()
+    # === TUCT Aggregation（注释 if 分支并取消注释 else 分支可恢复原版）===
+    if parent_indices is not None and children_indices is not None:
+        # Aggregate TUCT for identical state-action pairs
+        aggregated_tuct = {}
+        for idx in range(current_step + 1):
+            parent = int(parent_indices[idx, env_idx].item())
+            if parent != -1:
+                representative = children_indices[parent][env_idx][0]
+            else:
+                current_tid = int(tid_values[idx].item())
+                for s in range(current_step + 1):
+                    if (int(parent_indices[s, env_idx].item()) == -1 and
+                        int(tid_values[s].item()) == current_tid):
+                        representative = s
+                        break
+            if representative not in aggregated_tuct:
+                aggregated_tuct[representative] = 0.0
+            aggregated_tuct[representative] += tuct[idx].item()
+        best_action_idx = max(aggregated_tuct, key=aggregated_tuct.get)
+        best_tuct = aggregated_tuct[best_action_idx]
+    else:
+        best_action_idx = tuct.argmax().item()
+        best_tuct = tuct[best_action_idx].item()
 
     root_tuct_value = max(adv.mean().item(), root_tuct)
 
@@ -611,6 +647,7 @@ if __name__ == "__main__":
                         parent_indices=parent_indices,
                         children_indices=children_indices,
                         advantages=advantages,
+                        tid=tid,
                         gamma=args.gamma,
                         gae_lambda=args.gae_lambda,
                     )
@@ -637,6 +674,8 @@ if __name__ == "__main__":
                         tree_branches=tree_branches[env_idx],
                         N_total=N_total[env_idx],
                         root_tuct=args.root_tuct,
+                        parent_indices=parent_indices,  # 聚合参数（注释可恢复原版）
+                        children_indices=children_indices,  # 聚合参数（注释可恢复原版）
                     )
 
                     # State restoration
@@ -691,6 +730,7 @@ if __name__ == "__main__":
                     parent_indices=parent_indices,
                     children_indices=children_indices,
                     advantages=advantages,
+                    tid=tid,
                     gamma=args.gamma,
                     gae_lambda=args.gae_lambda,
                     next_value=next_value[env_idx].item(),
