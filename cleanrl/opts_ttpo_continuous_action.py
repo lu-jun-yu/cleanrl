@@ -382,6 +382,7 @@ def select_next_action(
     tree_branches: Dict[int, int],
     N_total: int,
     root_tuct: float,
+    dones: torch.Tensor,  # 终止标志，mask 掉 done=True 的位置
     parent_indices: torch.Tensor = None,  # 聚合参数（注释调用处可恢复原版）
     children_indices: List[List[List[int]]] = None,  # 聚合参数（注释调用处可恢复原版）
 ) -> int:
@@ -412,6 +413,7 @@ def select_next_action(
     adv = advantages[:current_step + 1, env_idx]  # (current_step+1,)
     w = weights[:current_step + 1, 0]  # (current_step+1,)
     tid_values = tid[:current_step + 1, env_idx]  # (current_step+1,)
+    done_mask = dones[:current_step + 1, env_idx] == True  # (current_step+1,)
 
     # Get N_subtree for each action via tid mapping
     N_subtree = torch.tensor(
@@ -427,9 +429,11 @@ def select_next_action(
 
     # === TUCT Aggregation（注释 if 分支并取消注释 else 分支可恢复原版）===
     if parent_indices is not None and children_indices is not None:
-        # Aggregate TUCT for identical state-action pairs
+        # Aggregate TUCT for identical state-action pairs (skip done=True)
         aggregated_tuct = {}
         for idx in range(current_step + 1):
+            if done_mask[idx]:
+                continue
             parent = int(parent_indices[idx, env_idx].item())
             if parent != -1:
                 representative = children_indices[parent][env_idx][0]
@@ -446,6 +450,7 @@ def select_next_action(
         best_action_idx = max(aggregated_tuct, key=aggregated_tuct.get)
         best_tuct = aggregated_tuct[best_action_idx]
     else:
+        tuct[done_mask] = float('-inf')
         best_action_idx = tuct.argmax().item()
         best_tuct = tuct[best_action_idx].item()
 
@@ -674,6 +679,7 @@ if __name__ == "__main__":
                         tree_branches=tree_branches[env_idx],
                         N_total=N_total[env_idx],
                         root_tuct=args.root_tuct,
+                        dones=dones,
                         parent_indices=parent_indices,  # 聚合参数（注释可恢复原版）
                         children_indices=children_indices,  # 聚合参数（注释可恢复原版）
                     )
