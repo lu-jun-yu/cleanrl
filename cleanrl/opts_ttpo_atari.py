@@ -285,33 +285,15 @@ def compute_tree_gae(
         # Compute delta and advantage
         delta = rewards[current, env_idx] + gamma * V_next - V_current
         if len(children) == 0:
-            current_adv = delta
+            advantages[current, env_idx] = delta
         else:
-            current_adv = delta + gamma * gae_lambda * advantages[children[0], env_idx]
-
-        # Sync advantages for identical state-action pairs
-        parent = parent_indices[current, env_idx].item()
-        if parent != -1:
-            siblings = children_indices[parent][env_idx]
-            n = len(siblings)
-            old_avg = advantages[siblings[0], env_idx]
-            new_avg = (old_avg * (n - 1) + current_adv) / n
-            for s in siblings:
-                advantages[s, env_idx] = new_avg
-        else:
-            current_tid = int(tid[current, env_idx].item())
-            first_layer_siblings = []
-            for s in range(terminal_step + 1):
-                if (parent_indices[s, env_idx].item() == -1 and
-                    int(tid[s, env_idx].item()) == current_tid):
-                    first_layer_siblings.append(s)
-            n = len(first_layer_siblings)
-            old_avg = advantages[first_layer_siblings[0], env_idx]
-            new_avg = (old_avg * (n - 1) + current_adv) / n
-            for s in first_layer_siblings:
-                advantages[s, env_idx] = new_avg
+            # Branch node
+            child_advs = torch.stack([advantages[child, env_idx] for child in children])
+            mean_child_adv = child_advs.mean()
+            advantages[current, env_idx] = delta + gamma * gae_lambda * mean_child_adv
 
         # Move to parent
+        parent = parent_indices[current, env_idx].item()
         if parent == -1:
             break
         current = parent
@@ -342,7 +324,7 @@ def compute_branch_weight_factors(
     """
     device = parent_indices.device
     num_target_envs = len(env_indices)
-    weights = torch.zeros((num_steps, num_target_envs), device=device, dtype=torch.float32)
+    weights = torch.ones((num_steps, num_target_envs), device=device, dtype=torch.float32)
 
     # Convert env_indices to tensor for vectorized operations
     env_tensor = torch.tensor(env_indices, device=device, dtype=torch.long)
@@ -387,9 +369,9 @@ def select_next_action(
     tree_branches: Dict[int, int],
     N_total: int,
     root_tuct: float,
-    dones: torch.Tensor,  # 终止标志，mask 掉 done=True 的位置
-    parent_indices: torch.Tensor = None,  # 聚合参数（注释调用处可恢复原版）
-    children_indices: List[List[List[int]]] = None,  # 聚合参数（注释调用处可恢复原版）
+    dones: torch.Tensor,
+    parent_indices: torch.Tensor,
+    children_indices: List[List[List[int]]],
 ) -> int:
     """
     Select the action with highest TUCT value using vectorized operations.
@@ -428,17 +410,29 @@ def select_next_action(
     exploitation = adv / w
     exploration = torch.sqrt(torch.log(torch.tensor(N_total + 1, dtype=torch.float32, device=adv.device))) / N_subtree
     tuct = exploitation * exploration
-
     tuct[done_mask] = float('-inf')
-    best_action_idx = tuct.argmax().item()
-    best_tuct = tuct[best_action_idx].item()
 
-    root_tuct_value = max(adv.abs().mean().item(), root_tuct)
+    action_groups = {}
+    for t in range(current_step + 1):
+        if done_mask[t]:
+            continue
+        parent = parent_indices[t, env_idx].item()
+        key = (True, int(tid_values[t].item())) if parent == -1 else (False, parent)
+        if key not in action_groups:
+            action_groups[key] = (t, [])
+        action_groups[key][1].append(tuct[t].item())
 
-    if root_tuct_value > best_tuct:
+    if not action_groups:
         return -1
-    else:
-        return best_action_idx
+
+    # first_idx -> avg_tuct
+    idx_to_avg_tuct = {first_idx: sum(tucts) / len(tucts) for first_idx, tucts in action_groups.values()}
+    best_idx = max(idx_to_avg_tuct, key=idx_to_avg_tuct.get)
+    best_tuct = idx_to_avg_tuct[best_idx]
+
+    root_tuct_value = max(adv.mean().item(), root_tuct)
+
+    return -1 if root_tuct_value > best_tuct else best_idx
 
 
 if __name__ == "__main__":
@@ -682,10 +676,11 @@ if __name__ == "__main__":
                     else:
                         # Selected action - restore to parent state and repeat the action
                         parent = parent_indices[selected, env_idx].item()
+                        selected_tid = int(tid[selected, env_idx].item())
                         if parent == -1:
                             envs[env_idx].restore_state(root_states[env_idx])
                             next_obs[env_idx] = obs[0, env_idx]
-                            init_weights[env_idx][current_tid[env_idx]] += 1
+                            init_weights[env_idx][selected_tid] += 1
                         else:
                             envs[env_idx].restore_state(env_states[parent][env_idx])
                             next_obs[env_idx] = obs[selected, env_idx]

@@ -255,32 +255,26 @@ for step in range(num_steps):
 
 ### 5.2 TreeGAE
 
-从终止节点回溯到 root，更新优势估计，并同步相同状态-动作对的优势。
+从终止节点回溯到 root，计算树结构上的优势估计。对于分支节点，使用子节点优势的均值进行回传。
 
 ```
+从终止节点开始，沿 parent_indices 回溯到 root（parent=-1）：
+
 V_next 的计算：
-    若无子节点且 dones[t] = True：V_next = 0（终止）
+    若无子节点且 dones[t] = True：V_next = 0（终止状态）
     若无子节点且 dones[t] = False：V_next = bootstrap_value（未终止叶节点）
-    若有子节点：V_next = values[children[0]]
+    若有子节点：V_next = values[children[0]]（所有子节点状态相同，取第一个即可）
 
 δ_t = rewards[t] + γ * V_next - values[t]
 
-优势计算（同步后 children 优势相同，直接用第一个）：
-    若无子节点：current_adv = δ_t
-    若有子节点：current_adv = δ_t + γ * λ * A_children[0]
+优势计算：
+    若无子节点（叶节点）：A_t = δ_t
+    若有子节点（分支节点）：A_t = δ_t + γ * λ * mean(children_advs)
 
-优势同步（相同状态-动作对应有相同优势）：
-    中间节点（parent != -1）：
-        siblings = children_indices[parent]
-        n = len(siblings)
-        new_avg = (old_avg * (n-1) + current_adv) / n
-        广播 new_avg 到所有 siblings
-
-    开头节点（parent == -1）：
-        找所有 parent=-1 且 tid 相同的节点
-        n = len(first_layer_siblings)
-        new_avg = (old_avg * (n-1) + current_adv) / n
-        广播 new_avg 到所有 first_layer_siblings
+说明：
+    - 分支节点的子节点代表从同一状态-动作对出发的不同后续轨迹
+    - 通过对子节点优势取均值，自然实现了不同轨迹的优势聚合
+    - 这与策略梯度中通过 branch_weight_factor 的聚合效果一致
 ```
 
 ### 5.3 TUCT（Tree UCT）
@@ -296,11 +290,21 @@ TUCT(t) = exploitation * exploration
     N_total = 当前树的终止轨迹总数
     N_subtree = tree_branches[env][tid[t, env]]（通过 tid 映射）
 
+动作聚合：
+    相同状态-动作对可能有多个索引（不同后续轨迹），需要聚合后再选择：
+    - 相同父节点（parent != -1）的节点是相同动作
+    - parent == -1 且相同 tid 的节点是相同动作
+
+    聚合方式：
+    1. 按动作身份分组：key = (is_root, tid) if parent == -1 else (is_child, parent)
+    2. 计算每组的平均 TUCT
+    3. 选择平均 TUCT 最大的组，返回该组第一个索引
+
 根节点的 TUCT：
     root_tuct_value = max(mean(所有节点的 A), root_tuct 参数)
 
 选择规则：
-    选择 TUCT 值最大的节点
+    选择聚合后 TUCT 值最大的动作
     若 root_tuct_value 最大，则选择根节点（selected = -1）
 ```
 

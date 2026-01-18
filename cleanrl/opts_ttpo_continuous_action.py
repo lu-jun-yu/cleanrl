@@ -281,33 +281,15 @@ def compute_tree_gae(
         # Compute delta and advantage
         delta = rewards[current, env_idx] + gamma * V_next - V_current
         if len(children) == 0:
-            current_adv = delta
+            advantages[current, env_idx] = delta
         else:
-            current_adv = delta + gamma * gae_lambda * advantages[children[0], env_idx]
-
-        # Sync advantages for identical state-action pairs
-        parent = parent_indices[current, env_idx].item()
-        if parent != -1:
-            siblings = children_indices[parent][env_idx]
-            n = len(siblings)
-            old_avg = advantages[siblings[0], env_idx]
-            new_avg = (old_avg * (n - 1) + current_adv) / n
-            for s in siblings:
-                advantages[s, env_idx] = new_avg
-        else:
-            current_tid = int(tid[current, env_idx].item())
-            first_layer_siblings = []
-            for s in range(terminal_step + 1):
-                if (parent_indices[s, env_idx].item() == -1 and
-                    int(tid[s, env_idx].item()) == current_tid):
-                    first_layer_siblings.append(s)
-            n = len(first_layer_siblings)
-            old_avg = advantages[first_layer_siblings[0], env_idx]
-            new_avg = (old_avg * (n - 1) + current_adv) / n
-            for s in first_layer_siblings:
-                advantages[s, env_idx] = new_avg
+            # Branch node
+            child_advs = torch.stack([advantages[child, env_idx] for child in children])
+            mean_child_adv = child_advs.mean()
+            advantages[current, env_idx] = delta + gamma * gae_lambda * mean_child_adv
 
         # Move to parent
+        parent = parent_indices[current, env_idx].item()
         if parent == -1:
             break
         current = parent
@@ -338,7 +320,7 @@ def compute_branch_weight_factors(
     """
     device = parent_indices.device
     num_target_envs = len(env_indices)
-    weights = torch.zeros((num_steps, num_target_envs), device=device, dtype=torch.float32)
+    weights = torch.ones((num_steps, num_target_envs), device=device, dtype=torch.float32)
 
     # Convert env_indices to tensor for vectorized operations
     env_tensor = torch.tensor(env_indices, device=device, dtype=torch.long)
@@ -378,9 +360,11 @@ def select_next_action(
     env_idx: int,
     current_step: int,
     advantages: torch.Tensor,
+    init_weights: Dict[int, int],
     weights: torch.Tensor,
     tid: torch.Tensor,
     tree_branches: Dict[int, int],
+    state_branches: torch.Tensor,
     N_total: int,
     root_tuct: float,
     dones: torch.Tensor,  # 终止标志，mask 掉 done=True 的位置
@@ -412,9 +396,10 @@ def select_next_action(
 
     # Extract data for this environment up to current_step
     adv = advantages[:current_step + 1, env_idx]  # (current_step+1,)
-    w = weights[:current_step + 1, 0]  # (current_step+1,)
+    w = weights[:current_step + 1]  # (current_step+1,)
     tid_values = tid[:current_step + 1, env_idx]  # (current_step+1,)
     done_mask = dones[:current_step + 1, env_idx] == True  # (current_step+1,)
+    state_branches = state_branches[:current_step + 1, env_idx]  # (current_step+1,)
 
     # Get N_subtree for each action via tid mapping
     N_subtree = torch.tensor(
@@ -423,22 +408,55 @@ def select_next_action(
         device=adv.device
     )
 
+    action_branches = torch.ones((current_step + 1,), device=adv.device, dtype=torch.int32)
+    for i in range(current_step + 1):
+        if parent_indices[i, env_idx].item() != -1:
+            action_branches[i] = state_branches[parent_indices[i, env_idx].item()]
+        else:
+            action_branches[i] = init_weights.get(int(tid_values[i].item()), 1)
+
+    Q_values = adv #+ values[:current_step + 1, env_idx]
+
+    # cumulative_Q_values = []
+    # for i in range(current_step + 1):
+    #     if parent_indices[i, env_idx].item() == -1:
+    #         cumulative_Q_values.append([Q_values[i]])
+    #     else:
+    #         cumulative_Q_values.append(cumulative_Q_values[parent_indices[i, env_idx].item()] + [Q_values[i]])
+    # for i in range(current_step + 1):
+    #     cumulative_Q_values[i] = np.mean(cumulative_Q_values[i])
+    # cumulative_Q_values = torch.tensor(cumulative_Q_values, device=Q_values.device, dtype=torch.float32)
+    # cumulative_Q_values -= cumulative_Q_values.min()
+
     # Compute TUCT = (A_t / W_t) * sqrt(log(N_total + 1)) / N_subtree
-    exploitation = adv / w
-    exploration = torch.sqrt(torch.log(torch.tensor(N_total + 1, dtype=torch.float32, device=adv.device))) / N_subtree
-    tuct = exploitation * exploration
+    exploitation = Q_values * 1 / w
+    # exploration = torch.sqrt(torch.log(torch.tensor(N_total + 1, dtype=torch.float32, device=adv.device))) / N_subtree
+    exploration = torch.sqrt(torch.log(torch.tensor(N_subtree, dtype=torch.float32, device=adv.device)))
+    tuct = exploitation - exploration
 
     tuct[done_mask] = float('-inf')
-    best_action_idx = tuct.argmax().item()
-    best_tuct = tuct[best_action_idx].item()
 
-    root_tuct_value = max(adv.max().item(), root_tuct)
+    action_groups = {}
+    for t in range(current_step + 1):
+        if done_mask[t]:
+            continue
+        parent = parent_indices[t, env_idx].item()
+        key = (True, int(tid_values[t].item())) if parent == -1 else (False, parent)
+        if key not in action_groups:
+            action_groups[key] = (t, [])
+        action_groups[key][1].append(tuct[t].item())
 
-    # Compare with root - if root wins, start new trajectory from root state
-    if root_tuct_value > best_tuct:
+    if not action_groups:
         return -1
-    else:
-        return best_action_idx
+
+    # first_idx -> avg_tuct
+    idx_to_avg_tuct = {first_idx: sum(tucts) / len(tucts) for first_idx, tucts in action_groups.values()}
+    best_idx = max(idx_to_avg_tuct, key=idx_to_avg_tuct.get)
+    best_tuct = idx_to_avg_tuct[best_idx]
+
+    root_tuct_value = 0.0 # max(adv.mean().item(), root_tuct)
+
+    return -1 if root_tuct_value > best_tuct else best_idx
 
 
 if __name__ == "__main__":
@@ -655,9 +673,11 @@ if __name__ == "__main__":
                         env_idx=env_idx,
                         current_step=step,
                         advantages=advantages,
-                        weights=weights[:, i:i+1],
+                        init_weights=init_weights[env_idx],
+                        weights=weights[:, i],
                         tid=tid,
                         tree_branches=tree_branches[env_idx],
+                        state_branches=state_branches,
                         N_total=N_total[env_idx],
                         root_tuct=args.root_tuct,
                         dones=dones,
@@ -681,11 +701,12 @@ if __name__ == "__main__":
                     else:
                         # Selected action - restore to parent state and repeat the action
                         parent = parent_indices[selected, env_idx].item()
+                        selected_tid = int(tid[selected, env_idx].item())
                         if parent == -1:
                             envs[env_idx].restore_state(root_states[env_idx])
                             next_obs[env_idx] = obs[0, env_idx]
-                            # Update init_weights for this tid
-                            init_weights[env_idx][current_tid[env_idx]] += 1
+                            # Update init_weights for the SELECTED node's tid (not current_tid)
+                            init_weights[env_idx][selected_tid] += 1
                         else:
                             envs[env_idx].restore_state(env_states[parent][env_idx])
                             next_obs[env_idx] = obs[selected, env_idx]
@@ -709,7 +730,7 @@ if __name__ == "__main__":
             os.makedirs("./results", exist_ok=True)
             # Generate filename: {task}_{算法名}_{日期}.txt
             date_str = datetime.now().strftime("%Y%m%d")
-            filename = f"./results/{args.env_id}_{args.exp_name}_{date_str}_{args.seed}.txt"
+            filename = f"./results/{args.env_id}_{args.exp_name}_{date_str}.txt" # _{args.seed}
             # Append mean episodic return to file (one value per line)
             with open(filename, "a") as f:
                 f.write(f"{mean_episodic_return}\n")
@@ -766,8 +787,13 @@ if __name__ == "__main__":
             for start in range(0, args.batch_size, args.minibatch_size):
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
-
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
+                try:
+                    _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
+                except Exception as e:
+                    print(f"b_obs[mb_inds]: {b_obs[mb_inds]}")
+                    print(f"b_actions[mb_inds]: {b_actions[mb_inds]}")
+                    print(f"actor_mean: {agent.actor_mean(b_obs[mb_inds])}")
+                    raise e
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -828,6 +854,7 @@ if __name__ == "__main__":
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
+        print()
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
     if args.save_model:

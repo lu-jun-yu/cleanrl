@@ -2,6 +2,7 @@
 import os
 import random
 import time
+from datetime import datetime
 from dataclasses import dataclass
 
 import gymnasium as gym
@@ -198,6 +199,9 @@ if __name__ == "__main__":
     next_done = torch.zeros(args.num_envs).to(device)
 
     for iteration in range(1, args.num_iterations + 1):
+        # Initialize episodic_returns for this iteration
+        episodic_returns = []
+        
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
@@ -226,8 +230,21 @@ if __name__ == "__main__":
                 for info in infos["final_info"]:
                     if info and "episode" in info:
                         print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+                        episodic_returns.append(info["episode"]["r"][0])
                         writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                         writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+
+        # Calculate mean episodic return and save to file
+        if episodic_returns:
+            mean_episodic_return = sum(episodic_returns) / len(episodic_returns)
+            # Create results directory if it doesn't exist
+            os.makedirs("./results", exist_ok=True)
+            # Generate filename: {task}_{算法名}_{日期}.txt
+            date_str = datetime.now().strftime("%Y%m%d")
+            filename = f"./results/{args.env_id}_{args.exp_name}_{date_str}_{args.seed}.txt"
+            # Append mean episodic return to file (one value per line)
+            with open(filename, "a") as f:
+                f.write(f"{mean_episodic_return}\n")
 
         # bootstrap value if not done
         with torch.no_grad():
