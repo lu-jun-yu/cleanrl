@@ -2,6 +2,7 @@
 import os
 import random
 import time
+import json
 from datetime import datetime
 from dataclasses import dataclass
 
@@ -57,7 +58,7 @@ class Args:
     """the discount factor gamma"""
     gae_lambda: float = 0.95
     """the lambda for the general advantage estimation"""
-    num_minibatches: int = 64
+    num_minibatches: int = 32
     """the number of mini-batches"""
     update_epochs: int = 10
     """the K epochs to update the policy"""
@@ -229,22 +230,34 @@ if __name__ == "__main__":
             if "final_info" in infos:
                 for info in infos["final_info"]:
                     if info and "episode" in info:
-                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+                        print(f"global_step={global_step}, episodic_return={info['episode']['r'][0]}")
                         episodic_returns.append(info["episode"]["r"][0])
                         writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                         writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
 
-        # Calculate mean episodic return and save to file
-        if episodic_returns:
-            mean_episodic_return = sum(episodic_returns) / len(episodic_returns)
-            # Create results directory if it doesn't exist
-            os.makedirs("./results", exist_ok=True)
-            # Generate filename: {task}_{算法名}_{日期}.txt
-            date_str = datetime.now().strftime("%Y%m%d")
-            filename = f"./results/{args.env_id}_{args.exp_name}_{date_str}_{args.seed}.txt"
-            # Append mean episodic return to file (one value per line)
-            with open(filename, "a") as f:
-                f.write(f"{mean_episodic_return}\n")
+        # Save results
+        mean_return = sum(episodic_returns) / len(episodic_returns) if episodic_returns else 0.0
+        max_return = max(episodic_returns) if episodic_returns else 0.0
+        min_return = min(episodic_returns) if episodic_returns else 0.0
+        print(f"Iteration {iteration}: mean_return={mean_return:.4f}, max_return={max_return:.4f}, min_return={min_return:.4f}")
+
+        os.makedirs("./results", exist_ok=True)
+        date_str = datetime.now().strftime("%Y%m%d")
+        result_filename = f"./results/1_2048/{args.env_id}_{args.exp_name}_{date_str}_{args.seed}.json"
+        if os.path.exists(result_filename):
+            with open(result_filename, "r") as f:
+                results_data = json.load(f)
+        else:
+            results_data = []
+
+        results_data.append({
+            "step": str(global_step),
+            "mean_return": str(mean_return),
+            "max_return": str(max_return),
+            "min_return": str(min_return)
+        })
+        with open(result_filename, "w") as f:
+            json.dump(results_data, f, indent=4)
 
         # bootstrap value if not done
         with torch.no_grad():

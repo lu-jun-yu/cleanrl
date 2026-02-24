@@ -2,6 +2,8 @@
 import os
 import random
 import time
+import json
+from datetime import datetime
 from dataclasses import dataclass
 
 import gymnasium as gym
@@ -200,6 +202,8 @@ if __name__ == "__main__":
     next_done = torch.zeros(args.num_envs).to(device)
 
     for iteration in range(1, args.num_iterations + 1):
+        episodic_returns = []
+        
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
@@ -227,9 +231,32 @@ if __name__ == "__main__":
             if "final_info" in infos:
                 for info in infos["final_info"]:
                     if info and "episode" in info:
-                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+                        print(f"global_step={global_step}, episodic_return={info['episode']['r'][0]}")
+                        episodic_returns.append(info["episode"]["r"][0])
                         writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                         writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+
+        # Save results
+        mean_return = sum(episodic_returns) / len(episodic_returns) if episodic_returns else 0.0
+        max_return = max(episodic_returns) if episodic_returns else 0.0
+        print(f"Iteration {iteration}: mean_return={mean_return:.4f}, max_return={max_return:.4f}")
+
+        os.makedirs("./results", exist_ok=True)
+        date_str = datetime.now().strftime("%Y%m%d")
+        result_filename = f"./results/{args.env_id}_{args.exp_name}_{date_str}_{args.seed}.json"
+        if os.path.exists(result_filename):
+            with open(result_filename, "r") as f:
+                results_data = json.load(f)
+        else:
+            results_data = []
+
+        results_data.append({
+            "step": str(global_step),
+            "mean_return": str(mean_return),
+            "max_return": str(max_return)
+        })
+        with open(result_filename, "w") as f:
+            json.dump(results_data, f, indent=4)
 
         # bootstrap value if not done
         with torch.no_grad():

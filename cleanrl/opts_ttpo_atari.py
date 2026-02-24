@@ -3,9 +3,10 @@
 import os
 import random
 import time
+import json
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import List
 
 import gymnasium as gym
 import numpy as np
@@ -80,9 +81,14 @@ class Args:
     target_kl: float = None
     """the target KL divergence threshold"""
 
-    # OPTS_TTPO specific arguments
-    root_tuct: float = 0.5
-    """the baseline TUCT value for root node selection"""
+    alpha: float = 1.0
+    """EMA smoothing factor for mean_return and std_return"""
+    max_search_per_tree: int = 4
+    """maximum number of tree searches per environment per iteration"""
+    c: float = 1.0
+    """exploration coefficient for TUCT node selection"""
+    beta: float = 0.0
+    """std_return coefficient for tree skip threshold"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -94,20 +100,40 @@ class Args:
 
 
 class AtariStateSnapshotWrapper(gym.Wrapper):
-    """Wrapper to support state snapshots for Atari environments using ALE."""
+    """Wrapper to support state snapshots for Atari environments using ALE.
+
+    Saves and restores:
+    - ALE simulator state (RAM, registers, etc.)
+    - FrameStack buffer (critical for correct observations)
+    - MaxAndSkipEnv observation buffer
+    - EpisodicLifeEnv life tracking state
+    - TimeLimit elapsed steps
+    - RecordEpisodeStatistics counters
+    """
 
     def __init__(self, env):
         super().__init__(env)
         self.ale = self.unwrapped.ale
-        # Find TimeLimit and RecordEpisodeStatistics wrappers
+
+        # Find all wrappers that need state saved/restored
         self._timelimit_wrapper = None
         self._record_stats_wrapper = None
+        self._framestack_wrapper = None
+        self._maxandskip_wrapper = None
+        self._episodiclife_wrapper = None
+
         current = env
         while current is not None:
             if hasattr(current, '_elapsed_steps'):  # TimeLimit wrapper
                 self._timelimit_wrapper = current
             if hasattr(current, 'episode_returns'):  # RecordEpisodeStatistics wrapper
                 self._record_stats_wrapper = current
+            if hasattr(current, 'frames') and hasattr(current, 'num_stack'):  # FrameStack wrapper
+                self._framestack_wrapper = current
+            if hasattr(current, '_obs_buffer') and hasattr(current, '_skip'):  # MaxAndSkipEnv wrapper
+                self._maxandskip_wrapper = current
+            if hasattr(current, 'lives') and hasattr(current, 'was_real_done'):  # EpisodicLifeEnv wrapper
+                self._episodiclife_wrapper = current
             current = getattr(current, 'env', None)
 
         # Track RecordEpisodeStatistics values for state snapshot
@@ -147,7 +173,7 @@ class AtariStateSnapshotWrapper(gym.Wrapper):
         return obs, info
 
     def clone_state(self):
-        """Clone the current environment state including wrapper states."""
+        """Clone the current environment state including all wrapper states."""
         ale_state = self.ale.cloneState()
 
         # Save TimeLimit state
@@ -161,11 +187,41 @@ class AtariStateSnapshotWrapper(gym.Wrapper):
             'episode_lengths': self._episode_length_snapshot,
         }
 
-        return (ale_state, timelimit_steps, record_stats)
+        # Save FrameStack buffer (critical for correct observations)
+        framestack_state = None
+        if self._framestack_wrapper is not None:
+            # self.frames is a deque of LazyFrames or arrays
+            frames_list = []
+            for frame in self._framestack_wrapper.frames:
+                if hasattr(frame, '__array__'):
+                    frames_list.append(np.array(frame, copy=True))
+                else:
+                    frames_list.append(frame)
+            framestack_state = frames_list
+
+        # Save MaxAndSkipEnv buffer
+        maxandskip_state = None
+        if self._maxandskip_wrapper is not None:
+            maxandskip_state = [
+                np.array(obs, copy=True) if obs is not None else None
+                for obs in self._maxandskip_wrapper._obs_buffer
+            ]
+
+        # Save EpisodicLifeEnv state
+        episodiclife_state = None
+        if self._episodiclife_wrapper is not None:
+            episodiclife_state = {
+                'lives': self._episodiclife_wrapper.lives,
+                'was_real_done': self._episodiclife_wrapper.was_real_done,
+            }
+
+        return (ale_state, timelimit_steps, record_stats, framestack_state, maxandskip_state, episodiclife_state)
 
     def restore_state(self, state):
-        """Restore the environment to a previous state including wrapper states."""
-        ale_state, timelimit_steps, record_stats = state
+        """Restore the environment to a previous state including all wrapper states."""
+        ale_state, timelimit_steps, record_stats, framestack_state, maxandskip_state, episodiclife_state = state
+
+        # Restore ALE state first
         self.ale.restoreState(ale_state)
 
         # Restore TimeLimit state
@@ -180,7 +236,24 @@ class AtariStateSnapshotWrapper(gym.Wrapper):
             self._episode_return_snapshot = record_stats['episode_returns']
             self._episode_length_snapshot = record_stats['episode_lengths']
 
-        return self.ale.getScreenRGB() if hasattr(self.ale, 'getScreenRGB') else None
+        # Restore FrameStack buffer (critical for correct observations)
+        if self._framestack_wrapper is not None and framestack_state is not None:
+            self._framestack_wrapper.frames.clear()
+            for frame in framestack_state:
+                self._framestack_wrapper.frames.append(frame)
+
+        # Restore MaxAndSkipEnv buffer
+        if self._maxandskip_wrapper is not None and maxandskip_state is not None:
+            for i, obs in enumerate(maxandskip_state):
+                if obs is not None:
+                    self._maxandskip_wrapper._obs_buffer[i] = np.array(obs, copy=True)
+                else:
+                    self._maxandskip_wrapper._obs_buffer[i] = None
+
+        # Restore EpisodicLifeEnv state
+        if self._episodiclife_wrapper is not None and episodiclife_state is not None:
+            self._episodiclife_wrapper.lives = episodiclife_state['lives']
+            self._episodiclife_wrapper.was_real_done = episodiclife_state['was_real_done']
 
 
 def make_env(env_id, idx, capture_video, run_name):
@@ -248,9 +321,7 @@ def compute_tree_gae(
     values: torch.Tensor,
     dones: torch.Tensor,
     parent_indices: torch.Tensor,
-    children_indices: List[List[List[int]]],
     advantages: torch.Tensor,
-    tid: torch.Tensor,
     gamma: float,
     gae_lambda: float,
     next_value: float = 0.0,
@@ -263,20 +334,19 @@ def compute_tree_gae(
         terminal_step: The step index of the terminal node
         env_idx: The environment index
         rewards, values, dones, parent_indices: Tree data tensors
-        children_indices: List of children indices for each node
         advantages: Tensor to store computed advantages (modified in-place)
-        tid: Trajectory ID for each node
         gamma, gae_lambda: GAE parameters
         next_value: Bootstrap value for non-terminal leaf nodes
     """
     current = terminal_step
 
     while True:
-        # Get current state value V(s_t)
+        # By this implementation's indexing: values[current] is the value of the
+        # state at the current tree node (after its parent action).
         V_current = values[current, env_idx]
 
-        # Compute V(next_state) from children or terminal
-        children = children_indices[current][env_idx]
+        # V_next uses the child node's stored value (same parent-state index semantics).
+        children = (parent_indices[: terminal_step + 1, env_idx] == current).nonzero(as_tuple=True)[0].tolist()
         if len(children) == 0:
             V_next = 0.0 if dones[current, env_idx] else next_value
         else:
@@ -292,9 +362,9 @@ def compute_tree_gae(
             mean_child_adv = child_advs.mean()
             advantages[current, env_idx] = delta + gamma * gae_lambda * mean_child_adv
 
-        # Move to parent
+        # Move to parent (parent < 0 means root node)
         parent = parent_indices[current, env_idx].item()
-        if parent == -1:
+        if parent < 0:
             break
         current = parent
 
@@ -303,136 +373,201 @@ def compute_branch_weight_factors(
     num_steps: int,
     parent_indices: torch.Tensor,
     state_branches: torch.Tensor,
-    tid: torch.Tensor,
-    init_weights: List[Dict[int, int]],
     env_indices: List[int],
+    root_branch_counts: List[dict],
 ) -> torch.Tensor:
     """
     Compute branch weight factors for specified environments.
-    W_t = init_weights[tid] if parent=-1, else W_parent * state_branches[parent]
+    W_t = W_parent * state_branches[parent]
+
+    For root nodes (parent < 0), the initial weight is the number of branches
+    originating from the same root state (from root_branch_counts).
 
     Args:
         num_steps: Number of steps collected
         parent_indices: Parent indices tensor (num_steps, num_envs)
         state_branches: State branches tensor (num_steps, num_envs)
-        tid: Trajectory ID tensor (num_steps, num_envs)
-        init_weights: List of dicts mapping tid to initial weight for each env
         env_indices: List of environment indices to compute weights for
+        root_branch_counts: List of dicts mapping root_id -> branch_count for each env
 
     Returns:
         weights: (num_steps, len(env_indices)) tensor of branch weight factors
     """
     device = parent_indices.device
-    num_target_envs = len(env_indices)
-    weights = torch.ones((num_steps, num_target_envs), device=device, dtype=torch.float32)
+    n_envs = len(env_indices)
+    env_t = torch.tensor(env_indices, device=device, dtype=torch.long)
 
-    # Convert env_indices to tensor for vectorized operations
-    env_tensor = torch.tensor(env_indices, device=device, dtype=torch.long)
-
+    weights = torch.ones((num_steps, n_envs), device=device, dtype=torch.float32)
     for step in range(num_steps):
-        # Get parent indices for target environments
-        parent_steps = parent_indices[step, env_tensor]  # (num_target_envs,)
+        p_steps = parent_indices[step, env_t]
+        is_root = p_steps < 0
 
-        # Mask for first layer nodes (parent == -1)
-        first_layer = parent_steps == -1
+        for i in is_root.nonzero(as_tuple=True)[0].tolist():
+            env_idx = env_indices[i]
+            tree_root_id = p_steps[i].item()
+            weights[step, i] = root_branch_counts[env_idx].get(tree_root_id, 1)
 
-        # First layer nodes: use init_weights[tid]
-        if first_layer.any():
-            for i in range(num_target_envs):
-                if first_layer[i]:
-                    env_idx = env_indices[i]
-                    tid_val = int(tid[step, env_idx].item())
-                    weights[step, i] = float(init_weights[env_idx].get(tid_val, 1))
-
-        # For other nodes, weight = parent_weight * parent_state_branches
-        if (~first_layer).any():
-            valid_parents = parent_steps[~first_layer]
-            valid_env_tensor = env_tensor[~first_layer]
-            valid_indices = torch.arange(num_target_envs, device=device)[~first_layer]
-
-            # Gather parent weights and branches
-            parent_weights = weights[valid_parents, valid_indices]
-            parent_branches = state_branches[valid_parents, valid_env_tensor]
-
-            # Compute weights
-            weights[step, ~first_layer] = parent_weights * parent_branches
+        if not is_root.all():
+            valid_parents = p_steps[~is_root]
+            valid_env_t = env_t[~is_root]
+            valid_indices = torch.arange(n_envs, device=device)[~is_root]
+            p_weights = weights[valid_parents, valid_indices]
+            p_branches = state_branches[valid_parents, valid_env_t]
+            weights[step, ~is_root] = p_weights * p_branches
 
     return weights
 
 
-def select_next_action(
-    env_idx: int,
+def select_next_states(
+    terminated_envs: list[int],
     current_step: int,
+    num_steps: int,
     advantages: torch.Tensor,
-    weights: torch.Tensor,
-    tid: torch.Tensor,
-    tree_branches: Dict[int, int],
-    N_total: int,
-    root_tuct: float,
-    dones: torch.Tensor,
     parent_indices: torch.Tensor,
-    children_indices: List[List[List[int]]],
-) -> int:
+    tree_indices: torch.Tensor,
+    skip_search: bool,
+    search_count: list[dict],
+    max_search: int,
+    c: float = 1.0,
+    tree_max_returns: list[dict] = None,
+    mean_return: float = None,
+    std_return: float = None,
+    beta: float = 1.0,
+) -> list[int]:
     """
-    Select the action with highest TUCT value using vectorized operations.
-    TUCT = (A_t / W_t) * sqrt(log(N_total + 1)) / N_subtree
+    Select which tree to search and which node to branch from.
+    Global cross-tree search: same tree's nodes may be non-contiguous in tensor.
 
-    Note: Each index t represents a state-action pair (s_parent, a_t).
-    This function selects which action to repeat from its parent state.
+    For each terminated env:
+    1. If skip_search: start new tree
+    2. For each non-exhausted tree, compute TUCT along optimal path with soft depth penalty
+    3. Find tree with min TUCT at its min_path_idx across all trees
+    4. If min TUCT > 0: no promising branching point → start new tree
+    5. If min TUCT <= 0: branch from that node
+
+    TUCT = exploitation + c * exploration
+      - exploitation: backward cumulative mean of centered advantages
+      - exploration: (sibling_count - 1) * max_abs_exploitation
 
     Args:
-        env_idx: The environment index
-        current_step: Current step index (select from actions 0 to current_step)
-        advantages: Advantages tensor (num_steps, num_envs)
-        weights: Branch weight factors (current_step+1, 1) for this env
-        tid: Trajectory ID tensor (num_steps, num_envs)
-        tree_branches: Dictionary mapping tid to branch count
-        N_total: Total number of terminal trajectories
-        root_tuct: Baseline TUCT value for selecting root state
+        terminated_envs: The terminated environment indices
+        current_step: Current step index (the terminal step of current episode)
+        advantages, dones, parent_indices, tree_indices: Tree data tensors
+        skip_search: Whether to skip search (e.g. last step)
+        search_count: Per-env dict mapping tree_id -> search count
+        max_search: Maximum searches per tree
+        c: Exploration coefficient for TUCT
 
     Returns:
-        Selected action index (-1 for root state, meaning start new trajectory)
+        list[int]: Selected indices (>= 0 to continue searching, < 0 for new tree)
     """
-    if current_step < 0:
-        return -1
+    selected = []
+    n_steps = current_step + 1
 
-    adv = advantages[:current_step + 1, env_idx]
-    w = weights[:current_step + 1, 0]
-    tid_values = tid[:current_step + 1, env_idx]
-    done_mask = dones[:current_step + 1, env_idx] == True
+    for env_idx in terminated_envs:
+        env_tree_ids = torch.unique(tree_indices[:n_steps, env_idx]).tolist()
+        num_env_trees = len(env_tree_ids)
 
-    N_subtree = torch.tensor(
-        [tree_branches.get(int(t.item()), 1) for t in tid_values],
-        dtype=torch.float32,
-        device=adv.device
-    )
-
-    exploitation = adv / w
-    exploration = torch.sqrt(torch.log(torch.tensor(N_total + 1, dtype=torch.float32, device=adv.device))) / N_subtree
-    tuct = exploitation * exploration
-    tuct[done_mask] = float('-inf')
-
-    action_groups = {}
-    for t in range(current_step + 1):
-        if done_mask[t]:
+        if skip_search or mean_return is None:
+            selected.append(-(num_env_trees + 1))
             continue
-        parent = parent_indices[t, env_idx].item()
-        key = (True, int(tid_values[t].item())) if parent == -1 else (False, parent)
-        if key not in action_groups:
-            action_groups[key] = (t, [])
-        action_groups[key][1].append(tuct[t].item())
 
-    if not action_groups:
-        return -1
+        # For each tree, compute TUCT and find the best branching point
+        best_tuct_val = float('inf')
+        best_step_overall = None
+        best_tree_id = None
+        best_depth = None
+        best_path_len = None
 
-    # first_idx -> avg_tuct
-    idx_to_avg_tuct = {first_idx: sum(tucts) / len(tucts) for first_idx, tucts in action_groups.values()}
-    best_idx = max(idx_to_avg_tuct, key=idx_to_avg_tuct.get)
-    best_tuct = idx_to_avg_tuct[best_idx]
+        for tid in env_tree_ids:
+            current_count = search_count[env_idx].get(tid, 0)
+            if current_count >= max_search:
+                continue
 
-    root_tuct_value = max(adv.mean().item(), root_tuct)
+            # Skip trees whose max return is above threshold
+            tree_best = tree_max_returns[env_idx].get(tid, float('-inf'))
+            if tree_best > mean_return + beta * std_return:
+                continue
 
-    return -1 if root_tuct_value > best_tuct else best_idx
+            # Get tree slice (non-contiguous nodes via tree_indices)
+            tree_mask = tree_indices[:n_steps, env_idx] == tid
+            tree_node_steps = tree_mask.nonzero(as_tuple=True)[0]
+            tree_advs = advantages[tree_node_steps, env_idx].clone()
+            tree_parents = parent_indices[tree_node_steps, env_idx]
+
+            # Find root nodes and start from root with max advantage
+            root_local_mask = tree_parents < 0
+            root_steps = tree_node_steps[root_local_mask]
+            root_advs = advantages[root_steps, env_idx]
+            best_root_local = root_advs.argmax().item()
+            current_node = root_steps[best_root_local].item()
+
+            # Trace optimal path: greedily choose child with max advantage
+            path = [current_node]
+            while True:
+                children_of_node = (parent_indices[:n_steps, env_idx] == current_node) & tree_mask
+                children_steps = children_of_node.nonzero(as_tuple=True)[0]
+                if len(children_steps) == 0:
+                    break
+                child_advs = advantages[children_steps, env_idx]
+                best_child = child_advs.argmax().item()
+                current_node = children_steps[best_child].item()
+                path.append(current_node)
+
+            # Extract path data
+            path_t = torch.tensor(path, device=advantages.device)
+            path_local_mask = torch.isin(tree_node_steps, path_t)
+            path_advs = tree_advs[path_local_mask]
+            path_steps = tree_node_steps[path_local_mask]
+
+            # Backward cumulative mean: for each node, mean of advantages from it to the end of path
+            n = len(path_advs)
+            exploitation = torch.zeros_like(path_advs)
+            running_sum = 0.0
+            for k in range(n - 1, -1, -1):
+                running_sum += path_advs[k].item()
+                exploitation[k] = running_sum / (n - k)
+
+            # Compute sibling counts for exploration term
+            path_parents_vals = tree_parents[path_local_mask]
+            sibling_counts = torch.zeros(len(path_steps), device=advantages.device)
+            for i in range(len(path_steps)):
+                sibling_counts[i] = (tree_parents == path_parents_vals[i]).sum()
+
+            max_abs_exploitation = exploitation.abs().max().item()
+            if max_abs_exploitation == 0:
+                max_abs_exploitation = 1.0
+
+            exploration = (sibling_counts - 1) * max_abs_exploitation
+
+            tuct = exploitation + c * exploration
+
+            min_path_idx = tuct.argmin().item()
+            min_tuct_val = tuct[min_path_idx].item()
+
+            if min_path_idx >= n - 1:
+                continue
+
+            if min_tuct_val < best_tuct_val:
+                best_tuct_val = min_tuct_val
+                best_step_overall = path_steps[min_path_idx].item()
+                best_tree_id = tid
+                best_depth = min_path_idx
+                best_path_len = len(path)
+
+        # Decision: if best TUCT > 0 or no searchable tree, start new tree
+        if best_step_overall is None:
+            print(f"    New Tree: best_tuct={best_tuct_val:.4f}")
+            selected.append(-(num_env_trees + 1))
+        else:
+            search_count[env_idx][best_tree_id] = search_count[env_idx].get(best_tree_id, 0) + 1
+            print(f"    Tree Search: env_idx={env_idx}, tree_id={best_tree_id}, "
+                  f"tuct={best_tuct_val:.4f}, "
+                  f"search_count={search_count[env_idx][best_tree_id]}, "
+                  f"depth={best_depth} / {best_path_len}")
+            selected.append(best_step_overall)
+
+    return selected
 
 
 if __name__ == "__main__":
@@ -483,21 +618,18 @@ if __name__ == "__main__":
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
     # OPTS_TTPO: Tree structure tensors
-    parent_indices = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long).to(device)
+    parent_indices = -torch.ones((args.num_steps, args.num_envs), dtype=torch.long).to(device)
+    # OPTS_TTPO: Tree id per node (used when nodes from the same tree are not contiguous)
+    tree_indices = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long).to(device)
     state_branches = torch.ones((args.num_steps, args.num_envs), dtype=torch.long).to(device)
-    tid = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long).to(device)
     advantages = torch.zeros((args.num_steps, args.num_envs)).to(device)
     returns = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
     # OPTS_TTPO: Non-tensor data
     env_states = [[None for _ in range(args.num_envs)] for _ in range(args.num_steps)]
-    children_indices = [[[] for _ in range(args.num_envs)] for _ in range(args.num_steps)]
-    tree_branches = [{0: 1} for _ in range(args.num_envs)]  # Initialize with tid=0, branches=1
-    init_weights = [{0: 1} for _ in range(args.num_envs)]  # Initial weights for first layer nodes
-    next_tid = [1] * args.num_envs  # Next available tid for each env
 
     # OPTS_TTPO: Root node data
-    root_states = [None] * args.num_envs
+    root_states = [[] for _ in range(args.num_envs)]
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
@@ -505,65 +637,71 @@ if __name__ == "__main__":
     next_obs = torch.zeros((args.num_envs,) + envs[0].observation_space.shape).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
 
+    for env_idx, env in enumerate(envs):
+        obs_data, _ = env.reset(seed=args.seed + env_idx)
+        next_obs[env_idx] = torch.Tensor(obs_data).to(device)
+        root_states[env_idx] = [env.clone_state()]
+
+    prev_mean_return = None
+    prev_std_return = None
+
     for iteration in range(1, args.num_iterations + 1):
         # Initialize episodic_returns for this iteration
         episodic_returns = []
-        
+        episodic_return_info = []  # (episodic_return, tid, step, env_idx)
+
+        # Initialize max_episodic_return
+        max_episodic_return = [float('-inf')] * args.num_envs
+
+        # OPTS_TTPO: root_branch_counts maintained incrementally
+        root_branch_counts = [{} for _ in range(args.num_envs)]
+
+        # search count per tree (inherit from previous iteration for continuing envs)
+        if iteration > 1:
+            new_search_count = [{} for _ in range(args.num_envs)]
+            for env_idx in range(args.num_envs):
+                if next_done[env_idx] == 0:
+                    tid = tree_indices[current_parent[env_idx], env_idx].item()
+                    prev_count = search_count[env_idx].get(tid, 0)
+                    if prev_count > 0:
+                        new_search_count[env_idx][-1] = prev_count
+            search_count = new_search_count
+        else:
+            search_count = [{} for _ in range(args.num_envs)]
+
+        # max episodic return per tree
+        tree_max_returns = [{} for _ in range(args.num_envs)]
+
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
 
-        # Reset all environments to new random initial states
         for env_idx, env in enumerate(envs):
-            obs_data, _ = env.reset()
-            next_obs[env_idx] = torch.Tensor(obs_data).to(device)
-            root_states[env_idx] = env.clone_state()
-
-        # Reset tree structures for new iteration
-        current_parent = [-1] * args.num_envs
-        pending_action = [None] * args.num_envs
-        pending_logprob = [None] * args.num_envs
-        N_total = [0] * args.num_envs
-        current_tid = [0] * args.num_envs
-        tree_branches = [{0: 1} for _ in range(args.num_envs)]
-        init_weights = [{0: 1} for _ in range(args.num_envs)]
-        next_tid = [1] * args.num_envs
+            if next_done[env_idx] == 1:
+                obs_data, _ = env.reset()
+                next_obs[env_idx] = torch.Tensor(obs_data).to(device)
+            root_states[env_idx] = [env.clone_state()]
         next_done.zero_()
 
-        # Reset state_branches to all ones
+        current_parent = [-1] * args.num_envs
+        next_done.zero_()
         state_branches.fill_(1)
-
-        # Reset advantages, tid, parent_indices
         advantages.zero_()
-        tid.zero_()
-        parent_indices.zero_()
-
-        # Reset children_indices
-        for step_idx in range(args.num_steps):
-            for env_idx in range(args.num_envs):
-                children_indices[step_idx][env_idx] = []
+        parent_indices.fill_(-1)
+        tree_indices.zero_()
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
 
-            # Save current obs and done (like PPO)
+            # Save current obs
             obs[step] = next_obs
-            dones[step] = next_done
 
             # Sample actions
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
-
-            # Override with pending actions if any
-            for env_idx in range(args.num_envs):
-                if pending_action[env_idx] is not None:
-                    action[env_idx] = pending_action[env_idx]
-                    logprob[env_idx] = pending_logprob[env_idx]
-                    pending_action[env_idx] = None
-                    pending_logprob[env_idx] = None
 
             actions[step] = action
             logprobs[step] = logprob
@@ -573,8 +711,21 @@ if __name__ == "__main__":
             rewards_list = []
             next_done_list = []
 
+            # Save parent_indices and update root_branch_counts
+            for env_idx in range(args.num_envs):
+                p = current_parent[env_idx]
+                parent_indices[step, env_idx] = p
+                tree_indices[step, env_idx] = p if p < 0 else tree_indices[p, env_idx]
+
+                # Update root_branch_counts if this is a root node
+                if p < 0:
+                    root_id = p
+                    root_branch_counts[env_idx][root_id] = root_branch_counts[env_idx].get(root_id, 0) + 1
+
+                current_parent[env_idx] = step
+
             for env_idx, env in enumerate(envs):
-                next_o, r, terminated, truncated, info = env.step(action[env_idx].cpu().item())
+                next_o, r, terminated, truncated, info = env.step(action[env_idx].cpu().numpy())
                 next_obs_list.append(next_o)
                 rewards_list.append(r)
                 next_done_list.append(terminated or truncated)
@@ -586,13 +737,21 @@ if __name__ == "__main__":
                 if (terminated or truncated) and "episode" in info:
                     ep_r = info['episode']['r']
                     ep_l = info['episode']['l']
-                    # Extract scalar value from array if needed
                     episodic_return = float(ep_r[0] if hasattr(ep_r, '__getitem__') else ep_r)
                     episodic_length = int(ep_l[0] if hasattr(ep_l, '__getitem__') else ep_l)
                     episodic_returns.append(episodic_return)
-                    print(f"global_step={global_step}, episodic_return={episodic_return}")
+                    episodic_return_info.append((episodic_return, tree_indices[step, env_idx].item(), step, env_idx))
+                    print(f"global_step={global_step}, episodic_return={episodic_return:.4f}")
                     writer.add_scalar("charts/episodic_return", episodic_return, global_step)
                     writer.add_scalar("charts/episodic_length", episodic_length, global_step)
+
+                    if episodic_return > max_episodic_return[env_idx]:
+                        max_episodic_return[env_idx] = episodic_return
+
+                    # Update per-tree max return
+                    tid = tree_indices[step, env_idx].item()
+                    if episodic_return > tree_max_returns[env_idx].get(tid, float('-inf')):
+                        tree_max_returns[env_idx][tid] = episodic_return
 
             # Convert to tensors
             next_obs = torch.stack([torch.Tensor(o) for o in next_obs_list]).to(device)
@@ -602,23 +761,12 @@ if __name__ == "__main__":
             # Update dones[step] to reflect terminal status after this step's action
             dones[step] = next_done
 
-            # Save parent_indices and tid
-            for env_idx in range(args.num_envs):
-                parent_indices[step, env_idx] = current_parent[env_idx]
-
-                if current_parent[env_idx] == -1:
-                    tid[step, env_idx] = current_tid[env_idx]
-                else:
-                    tid[step, env_idx] = tid[current_parent[env_idx], env_idx]
-                    children_indices[current_parent[env_idx]][env_idx].append(step)
-
             # Handle terminated environments
             terminated_envs = [i for i in range(args.num_envs) if next_done_list[i]]
 
             if len(terminated_envs) > 0:
                 # TreeGAE update
                 for env_idx in terminated_envs:
-                    N_total[env_idx] += 1
                     compute_tree_gae(
                         terminal_step=step,
                         env_idx=env_idx,
@@ -626,88 +774,49 @@ if __name__ == "__main__":
                         values=values,
                         dones=dones,
                         parent_indices=parent_indices,
-                        children_indices=children_indices,
                         advantages=advantages,
-                        tid=tid,
                         gamma=args.gamma,
                         gae_lambda=args.gae_lambda,
                     )
 
-                # Compute branch_weight_factors for all terminated envs at once
-                weights = compute_branch_weight_factors(
-                    num_steps=step + 1,
+                skip_search = step >= args.num_steps - 1
+
+                selected = select_next_states(
+                    terminated_envs=terminated_envs,
+                    current_step=step,
+                    num_steps=args.num_steps,
+                    advantages=advantages,
                     parent_indices=parent_indices,
-                    state_branches=state_branches,
-                    tid=tid,
-                    init_weights=init_weights,
-                    env_indices=terminated_envs,
+                    tree_indices=tree_indices,
+                    skip_search=skip_search,
+                    search_count=search_count,
+                    max_search=args.max_search_per_tree,
+                    c=args.c,
+                    tree_max_returns=tree_max_returns,
+                    mean_return=prev_mean_return,
+                    std_return=prev_std_return,
+                    beta=args.beta,
                 )
 
                 # TUCT selection and state restoration
                 for i, env_idx in enumerate(terminated_envs):
-                    # Select next action using pre-computed weights
-                    selected = select_next_action(
-                        env_idx=env_idx,
-                        current_step=step,
-                        advantages=advantages,
-                        weights=weights[:, i:i+1],
-                        tid=tid,
-                        tree_branches=tree_branches[env_idx],
-                        N_total=N_total[env_idx],
-                        root_tuct=args.root_tuct,
-                        dones=dones,
-                        parent_indices=parent_indices,  # 聚合参数（注释可恢复原版）
-                        children_indices=children_indices,  # 聚合参数（注释可恢复原版）
-                    )
-
-                    # State restoration
-                    if selected == -1:
-                        # Selected root
-                        envs[env_idx].restore_state(root_states[env_idx])
-                        next_obs[env_idx] = obs[0, env_idx]
-                        current_parent[env_idx] = -1
-                        pending_action[env_idx] = None
-
-                        # Create new trajectory
-                        current_tid[env_idx] = next_tid[env_idx]
-                        tree_branches[env_idx][current_tid[env_idx]] = 1
-                        init_weights[env_idx][current_tid[env_idx]] = 1
-                        next_tid[env_idx] += 1
+                    if selected[i] < 0:
+                        # Variance is stable, start a new tree
+                        obs_data, _ = envs[env_idx].reset()
+                        next_obs[env_idx] = torch.Tensor(obs_data).to(device)
+                        root_states[env_idx].insert(0, envs[env_idx].clone_state())
+                        current_parent[env_idx] = -len(root_states[env_idx])
+                        max_episodic_return[env_idx] = float('-inf')
                     else:
-                        # Selected action - restore to parent state and repeat the action
-                        parent = parent_indices[selected, env_idx].item()
-                        selected_tid = int(tid[selected, env_idx].item())
-                        if parent == -1:
-                            envs[env_idx].restore_state(root_states[env_idx])
-                            next_obs[env_idx] = obs[0, env_idx]
-                            init_weights[env_idx][selected_tid] += 1
+                        # Continue searching
+                        parent = parent_indices[selected[i], env_idx].item()
+                        if parent < 0:
+                            envs[env_idx].restore_state(root_states[env_idx][parent])
                         else:
                             envs[env_idx].restore_state(env_states[parent][env_idx])
-                            next_obs[env_idx] = obs[selected, env_idx]
                             state_branches[parent, env_idx] += 1
-
+                        next_obs[env_idx] = obs[selected[i], env_idx]
                         current_parent[env_idx] = parent
-                        pending_action[env_idx] = actions[selected, env_idx]
-                        pending_logprob[env_idx] = logprobs[selected, env_idx]
-                        current_tid[env_idx] = int(tid[selected, env_idx].item())
-                        tree_branches[env_idx][current_tid[env_idx]] += 1
-
-            # Update non-terminated environments
-            for env_idx in range(args.num_envs):
-                if not next_done_list[env_idx]:
-                    current_parent[env_idx] = step
-
-        # Calculate mean episodic return and save to file
-        if episodic_returns:
-            mean_episodic_return = sum(episodic_returns) / len(episodic_returns)
-            # Create results directory if it doesn't exist
-            os.makedirs("./results", exist_ok=True)
-            # Generate filename: {task}_{算法名}_{日期}.txt
-            date_str = datetime.now().strftime("%Y%m%d")
-            filename = f"./results/{args.env_id}_{args.exp_name}_{date_str}_{args.seed}.txt"
-            # Append mean episodic return to file (one value per line)
-            with open(filename, "a") as f:
-                f.write(f"{mean_episodic_return}\n")
 
         # Bootstrap value for non-terminal leaf nodes and recompute advantages
         with torch.no_grad():
@@ -723,9 +832,7 @@ if __name__ == "__main__":
                     values=values,
                     dones=dones,
                     parent_indices=parent_indices,
-                    children_indices=children_indices,
                     advantages=advantages,
-                    tid=tid,
                     gamma=args.gamma,
                     gae_lambda=args.gae_lambda,
                     next_value=next_value[env_idx].item(),
@@ -739,10 +846,64 @@ if __name__ == "__main__":
             num_steps=args.num_steps,
             parent_indices=parent_indices,
             state_branches=state_branches,
-            tid=tid,
-            init_weights=init_weights,
             env_indices=list(range(args.num_envs)),
+            root_branch_counts=root_branch_counts,
         )
+
+        # Compute tree-weighted aggregated returns
+        if episodic_return_info:
+            tid_groups = {}  # (env_idx, tid) -> [(return, step)]
+            for ep_return, tid, ep_step, ei in episodic_return_info:
+                key = (ei, tid)
+                if key not in tid_groups:
+                    tid_groups[key] = []
+                tid_groups[key].append((ep_return, ep_step))
+
+            aggregated_returns = []
+            for (ei, tid), entries in tid_groups.items():
+                weighted_sum = 0.0
+                weight_sum = 0.0
+                for ep_return, ep_step in entries:
+                    w = branch_weights[ep_step, ei].item()
+                    weighted_sum += ep_return / w
+                    weight_sum += 1.0 / w
+                aggregated_returns.append(weighted_sum / weight_sum if weight_sum > 0 else 0.0)
+
+            mean_return = sum(aggregated_returns) / len(aggregated_returns)
+            max_return = max(aggregated_returns)
+            min_return = min(aggregated_returns)
+            std_return = float(np.std(aggregated_returns)) if len(aggregated_returns) >= 2 else 0.0
+        else:
+            mean_return = 0.0
+            max_return = 0.0
+            min_return = 0.0
+            std_return = 0.0
+        print(f"Iteration {iteration}: mean_return={mean_return:.4f}, max_return={max_return:.4f}, min_return={min_return:.4f}")
+
+        # Update prev_mean_return and prev_std_return with EMA: alpha * new + (1 - alpha) * old
+        if prev_mean_return is None:
+            prev_mean_return = mean_return
+            prev_std_return = std_return
+        else:
+            prev_mean_return = args.alpha * mean_return + (1 - args.alpha) * prev_mean_return
+            prev_std_return = args.alpha * std_return + (1 - args.alpha) * prev_std_return
+
+        # Save results to JSON file
+        os.makedirs("./results", exist_ok=True)
+        result_filename = f"./results/{args.num_envs}_{args.num_steps}/{args.env_id}_opts_ttpo_atari_20260221_{args.seed}.json"
+        if os.path.exists(result_filename):
+            with open(result_filename, "r") as f:
+                results_data = json.load(f)
+        else:
+            results_data = []
+        results_data.append({
+            "step": str(global_step),
+            "mean_return": str(mean_return),
+            "max_return": str(max_return),
+            "min_return": str(min_return),
+        })
+        with open(result_filename, "w") as f:
+            json.dump(results_data, f, indent=4)
 
         # flatten the batch
         b_obs = obs.reshape((-1,) + envs[0].observation_space.shape)
@@ -776,16 +937,14 @@ if __name__ == "__main__":
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-                # Policy loss
+                # Policy loss (weighted by branch factors)
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss_per_sample = torch.max(pg_loss1, pg_loss2)
-
-                # Aggregate loss with branch_weight_factor correction
                 mb_weights = b_weights[mb_inds]
                 pg_loss = (pg_loss_per_sample / mb_weights).sum() / (1.0 / mb_weights).sum()
 
-                # Value loss
+                # Value loss (weighted by branch factors)
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
                     v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
@@ -796,9 +955,10 @@ if __name__ == "__main__":
                     )
                     v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * v_loss_max.mean()
+                    v_loss = 0.5 * (v_loss_max / mb_weights).sum() / (1.0 / mb_weights).sum()
                 else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                    v_loss_per_sample = (newvalue - b_returns[mb_inds]) ** 2
+                    v_loss = 0.5 * (v_loss_per_sample / mb_weights).sum() / (1.0 / mb_weights).sum()
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
@@ -825,6 +985,7 @@ if __name__ == "__main__":
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
+        print()
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
     for env in envs:
