@@ -79,14 +79,10 @@ class Args:
     target_kl: float = None
     """the target KL divergence threshold"""
 
-    alpha: float = 0.5
-    """EMA smoothing factor for mean_return and std_return"""
     max_search_per_tree: int = 4
     """maximum number of tree searches per environment per iteration"""
     c: float = 1.0
     """exploration coefficient for TUCT node selection"""
-    beta: float = 0.0
-    """std_return coefficient for tree skip threshold"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -563,9 +559,7 @@ def select_next_states(
     max_search: int,
     c: float = 1.0,
     tree_max_returns: list[dict] = None,
-    mean_return: float = None,
-    std_return: float = None,
-    beta: float = 1.0,
+    return_threshold: float = None,
 ) -> list[int]:
     """
     Select which tree to search and which node to branch from.
@@ -585,11 +579,13 @@ def select_next_states(
     Args:
         terminated_envs: The terminated environment indices
         current_step: Current step index (the terminal step of current episode)
-        advantages, dones, parent_indices, tree_indices: Tree data tensors
+        advantages, parent_indices, tree_indices: Tree data tensors
         skip_search: Whether to skip search (e.g. last step)
         search_count: Per-env dict mapping tree_id -> search count
         max_search: Maximum searches per tree
         c: Exploration coefficient for TUCT
+        tree_max_returns: Per-env dict mapping tree_id -> max episodic return
+        return_threshold: Windowed mean return threshold for gating
 
     Returns:
         list[int]: Selected indices (>= 0 to continue searching, < 0 for new tree)
@@ -601,7 +597,7 @@ def select_next_states(
         env_tree_ids = torch.unique(tree_indices[:n_steps, env_idx]).tolist()
         num_env_trees = len(env_tree_ids)
 
-        if skip_search or mean_return is None:
+        if skip_search or return_threshold is None:
             selected.append(-(num_env_trees + 1))
             continue
 
@@ -619,7 +615,7 @@ def select_next_states(
 
             # Skip trees whose max return is above threshold
             tree_best = tree_max_returns[env_idx].get(tid, float('-inf'))
-            if tree_best > mean_return + beta * std_return:
+            if tree_best > return_threshold:
                 continue
 
             # Get tree slice (non-contiguous nodes via tree_indices)
@@ -678,7 +674,7 @@ def select_next_states(
             min_path_idx = tuct.argmin().item()
             min_tuct_val = tuct[min_path_idx].item()
 
-            if min_path_idx >= n - 1:
+            if min_path_idx >= n - 2:
                 continue
 
             if min_tuct_val < best_tuct_val:
@@ -775,8 +771,7 @@ if __name__ == "__main__":
         next_obs[env_idx] = torch.Tensor(obs_data).to(device)
         root_states[env_idx] = [env.clone_state()]
 
-    prev_mean_return = None
-    prev_std_return = None
+    prev_mean_return = None  # stores previous iteration's mean_return as threshold
 
     for iteration in range(1, args.num_iterations + 1):
         # Initialize episodic_returns for this iteration
@@ -790,17 +785,7 @@ if __name__ == "__main__":
         root_branch_counts = [{} for _ in range(args.num_envs)]
 
         # search count per tree (inherit from previous iteration for continuing envs)
-        if iteration > 1:
-            new_search_count = [{} for _ in range(args.num_envs)]
-            for env_idx in range(args.num_envs):
-                if next_done[env_idx] == 0:
-                    tid = tree_indices[current_parent[env_idx], env_idx].item()
-                    prev_count = search_count[env_idx].get(tid, 0)
-                    if prev_count > 0:
-                        new_search_count[env_idx][-1] = prev_count
-            search_count = new_search_count
-        else:
-            search_count = [{} for _ in range(args.num_envs)]
+        search_count = [{} for _ in range(args.num_envs)]
 
         # max episodic return per tree
         tree_max_returns = [{} for _ in range(args.num_envs)]
@@ -926,9 +911,7 @@ if __name__ == "__main__":
                     max_search=args.max_search_per_tree,
                     c=args.c,
                     tree_max_returns=tree_max_returns,
-                    mean_return=prev_mean_return,
-                    std_return=prev_std_return,
-                    beta=args.beta,
+                    return_threshold=prev_mean_return,
                 )
 
                 # TUCT selection and state restoration
@@ -1013,17 +996,13 @@ if __name__ == "__main__":
             std_return = 0.0
         print(f"Iteration {iteration}: mean_return={mean_return:.4f}, max_return={max_return:.4f}, min_return={min_return:.4f}")
 
-        # Update prev_mean_return and prev_std_return with EMA: alpha * new + (1 - alpha) * old
-        if prev_mean_return is None:
-            prev_mean_return = mean_return
-            prev_std_return = std_return
-        else:
-            prev_mean_return = args.alpha * mean_return + (1 - args.alpha) * prev_mean_return
-            prev_std_return = args.alpha * std_return + (1 - args.alpha) * prev_std_return
+        prev_mean_return = mean_return
 
         # Save results to JSON file
-        os.makedirs("./results", exist_ok=True)
-        result_filename = f"./results/{args.num_envs}_{args.num_steps}/{args.env_id}_opts_ttpo_beta{args.beta}_continuous_action_20260222_{args.seed}.json"
+        algorithm_name = f"opts_ttpo_search{args.max_search_per_tree}_continuous_action_20260227"
+        folder_name = f"./results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
+        os.makedirs(folder_name, exist_ok=True)
+        result_filename = f"{folder_name}/{args.env_id}_{args.seed}.json"
         if os.path.exists(result_filename):
             with open(result_filename, "r") as f:
                 results_data = json.load(f)
