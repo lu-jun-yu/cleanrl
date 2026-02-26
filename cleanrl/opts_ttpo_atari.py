@@ -541,7 +541,7 @@ def select_next_states(
             min_path_idx = tuct.argmin().item()
             min_tuct_val = tuct[min_path_idx].item()
 
-            if min_path_idx >= n - 1:
+            if min_path_idx >= n - 2:
                 continue
 
             if min_tuct_val < best_tuct_val:
@@ -652,17 +652,7 @@ if __name__ == "__main__":
         root_branch_counts = [{} for _ in range(args.num_envs)]
 
         # search count per tree (inherit from previous iteration for continuing envs)
-        if iteration > 1:
-            new_search_count = [{} for _ in range(args.num_envs)]
-            for env_idx in range(args.num_envs):
-                if next_done[env_idx] == 0:
-                    tid = tree_indices[current_parent[env_idx], env_idx].item()
-                    prev_count = search_count[env_idx].get(tid, 0)
-                    if prev_count > 0:
-                        new_search_count[env_idx][-1] = prev_count
-            search_count = new_search_count
-        else:
-            search_count = [{} for _ in range(args.num_envs)]
+        search_count = [{} for _ in range(args.num_envs)]
 
         # max episodic return per tree
         tree_max_returns = [{} for _ in range(args.num_envs)]
