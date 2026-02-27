@@ -674,7 +674,7 @@ def select_next_states(
             min_path_idx = tuct.argmin().item()
             min_tuct_val = tuct[min_path_idx].item()
 
-            if min_path_idx >= n - 2:
+            if min_path_idx >= n - 1:
                 continue
 
             if min_tuct_val < best_tuct_val:
@@ -999,7 +999,7 @@ if __name__ == "__main__":
         prev_mean_return = mean_return
 
         # Save results to JSON file
-        algorithm_name = f"opts_ttpo_search{args.max_search_per_tree}_continuous_action_20260227"
+        algorithm_name = f"opts_ttpo_tail_length1_continuous_action_20260227"
         folder_name = f"./results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
         os.makedirs(folder_name, exist_ok=True)
         result_filename = f"{folder_name}/{args.env_id}_{args.seed}.json"

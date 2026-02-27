@@ -25,11 +25,8 @@ OPTS_TTPO（On-policy Parallel Tree Search + Tree Trajectory Policy Optimization
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| alpha | 1.0 | mean_return 和 std_return 的 EMA 平滑系数 |
 | max_search_per_tree | 4 | 每棵树每迭代最大搜索次数 |
 | c | 1.0 | TUCT 中 exploration 项系数 |
-| beta | 0.0 | 树跳过阈值系数，当树的最大 return 超过 mean_return + beta * std_return 时跳过 |
-| tail_length | 2 | TUCT 选中最优路径末端 tail_length 个节点时跳过该树 |
 
 
 ## 3. 数据结构
@@ -67,7 +64,7 @@ env_states 是二维列表（num_steps x num_envs），保存每步执行动作�
 
 ### 4.1 迭代初始化
 
-迭代开始时，只对上一迭代最后一步处于终止状态的环境执行 reset，未终止的环境保留 next_obs 和环境内部状态自然延续。所有环境都 clone 当前状态作为本迭代的根状态。然后重置 current_parent 为 -1、清零 advantages 和 dones、重置 parent_indices 为 -1、重置 state_branches 为 1、清零 tree_indices。
+迭代开始时，只对上一迭代最后一步处于终止状态的环境执行 reset，未终止的环境保留 next_obs 和环境内部状态自然延续。所有环境都 clone 当前状态作为本迭代的根状态。然后重置 current_parent 为 -1、清零 advantages 和 next_done、重置 parent_indices 为 -1、重置 state_branches 为 1、清零 tree_indices。
 
 延续的环境在第一步的 parent_indices 为 -1，因此 tree_id 也为 -1，与正常开新树的行为一致。延续 episode 的 RecordEpisodeStatistics 累计值在 wrapper 中自然保持，终止时报告完整的 episodic return。
 
@@ -95,7 +92,7 @@ env_states 是二维列表（num_steps x num_envs），保存每步执行动作�
 
 计算 branch_weight_factors。
 
-按 (env_idx, tree_id) 分组，对本迭代所有终止 episode 的 return 进行 branch_weight 加权平均，得到 aggregated_returns，进而计算 mean_return 和 std_return。通过 EMA 更新跨迭代的 prev_mean_return 和 prev_std_return，供下一迭代 TUCT 使用。
+按 (env_idx, tree_id) 分组，对本迭代所有终止 episode 的 return 进行 branch_weight 加权平均，得到 aggregated_returns，进而计算 mean_return。将 mean_return 直接作为下一迭代 TUCT 的 return_threshold（prev_mean_return = mean_return）。
 
 执行 PPO 更新，policy loss 和 value loss 均用 branch_weight 加权。
 
@@ -116,15 +113,17 @@ TD 误差 delta = reward + gamma * V_next - V_current。叶节点的 advantage �
 
 episode 终止时，为该环境跨所有树全局选择最佳分支点。
 
-对每棵树依次处理。首先跳过已达 max_search 次数的树和最大 return 超过 mean_return + beta * std_return 的树。
+首先处理两种直接开新树的情况：若当前是最后一步（skip_search=True），或 return_threshold 为 None（首次迭代，尚无 mean_return），则直接开新树。
+
+对每棵树依次处理。首先跳过已达 max_search 次数的树和最大 return 超过 return_threshold（即上一迭代的 mean_return）的树。
 
 对于剩余的树，找到其最优路径：从 advantage 最大的根节点出发，每步贪心选择 advantage 最大的子节点，直到叶节点。
 
-沿最优路径计算 TUCT 值。exploitation 是 backward cumulative mean，即节点 k 的 exploitation 等于从 k 到路径末端所有 advantage 的均值，反映从该点开始的子路径整体质量。exploration 等于 (sibling_count - 1) * max_abs_exploitation，其中 sibling_count 是与该节点共享父节点的兄弟数量，max_abs_exploitation 是整条路径上 exploitation 绝对值的最大值。TUCT = exploitation + c * exploration。
+沿最优路径计算 TUCT 值。exploitation 是 backward cumulative mean，即节点 k 的 exploitation 等于从 k 到路径末端所有 advantage 的均值，反映从该点开始的子路径整体质量。exploration 等于 (sibling_count - 1) * max_abs_exploitation，其中 sibling_count 是与该节点共享父节点的兄弟数量，max_abs_exploitation 是整条路径上 exploitation 绝对值的最大值（若为 0 则设为 1.0）。TUCT = exploitation + c * exploration。
 
-取路径上 TUCT 最小的节点作为候选分支点。若该节点位于路径末端 tail_length 个节点内，跳过这棵树。这一过滤的原因是：当 TUCT 最小值出现在末端时，说明整条最优路径的前半段表现尚可或已被充分探索，问题集中在末端，而末端的差表现通常是状态质量问题而非动作选择问题，从末端附近分支无法改善根本方向，且会浪费 search 预算。
+取路径上 TUCT 最小的节点作为候选分支点。若该节点位于路径的最后一个节点（即 min_path_idx >= path_length - 1），跳过这棵树。这一过滤的原因是：当 TUCT 最小值出现在末端时，说明整条最优路径的前半段表现尚可或已被充分探索，问题集中在末端，而末端的差表现通常是状态质量问题而非动作选择问题，从末端分支无法改善根本方向，且会浪费 search 预算。
 
-遍历所有树后，选择全局 TUCT 最小的分支点。若无可选树，开新树。
+遍历所有树后，选择全局 TUCT 最小的分支点。若无可选树（所有树都被跳过或搜索次数已满），开新树。
 
 ### 5.3 Branch Weight Factor
 
@@ -134,11 +133,11 @@ branch_weight 校正树形结构下的策略梯度，使其保持无偏。
 
 直觉：一个节点被经过的次数越多（因为其祖先被多次分支），它在数据中出现的频率就越高，需要除以 weight 来消除重复采样的偏差。
 
-### 5.4 Aggregated Returns 与 EMA
+### 5.4 Aggregated Returns
 
-每迭代结束时，按 (env_idx, tree_id) 对本迭代终止的 episode 分组。同组内各 episode 的 return 用 branch_weight 倒数加权平均，得到每组的 aggregated_return。对所有组求均值和标准差得到 mean_return 和 std_return。
+每迭代结束时，按 (env_idx, tree_id) 对本迭代终止的 episode 分组。同组内各 episode 的 return 用 branch_weight 倒数加权平均，得到每组的 aggregated_return。对所有组求均值得到 mean_return。
 
-通过 EMA 跨迭代平滑：prev_mean_return = alpha * mean_return + (1 - alpha) * prev_mean_return，std_return 同理。平滑后的值用于下一迭代 TUCT 中的树跳过阈值判断。
+mean_return 直接赋值给 prev_mean_return，作为下一迭代 TUCT 中的树跳过阈值（return_threshold）。首次迭代时 prev_mean_return 为 None，此时所有终止 episode 直接开新树，不进行树搜索。
 
 ### 5.5 策略梯度（TTPO）
 
