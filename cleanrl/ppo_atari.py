@@ -239,11 +239,13 @@ if __name__ == "__main__":
         # Save results
         mean_return = sum(episodic_returns) / len(episodic_returns) if episodic_returns else 0.0
         max_return = max(episodic_returns) if episodic_returns else 0.0
-        print(f"Iteration {iteration}: mean_return={mean_return:.4f}, max_return={max_return:.4f}")
+        min_return = min(episodic_returns) if episodic_returns else 0.0
+        print(f"Iteration {iteration}: mean_return={mean_return:.4f}, max_return={max_return:.4f}, min_return={min_return:.4f}")
 
-        os.makedirs("./results", exist_ok=True)
-        date_str = datetime.now().strftime("%Y%m%d")
-        result_filename = f"./results/{args.env_id}_{args.exp_name}_{date_str}_{args.seed}.json"
+        algorithm_name = f"{args.exp_name}_{datetime.now().strftime('%Y%m%d')}"
+        folder_name = f"./results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
+        os.makedirs(folder_name, exist_ok=True)
+        result_filename = f"{folder_name}/{args.env_id}_{args.seed}.json"
         if os.path.exists(result_filename):
             with open(result_filename, "r") as f:
                 results_data = json.load(f)
@@ -253,7 +255,8 @@ if __name__ == "__main__":
         results_data.append({
             "step": str(global_step),
             "mean_return": str(mean_return),
-            "max_return": str(max_return)
+            "max_return": str(max_return),
+            "min_return": str(min_return),
         })
         with open(result_filename, "w") as f:
             json.dump(results_data, f, indent=4)

@@ -516,13 +516,14 @@ def select_next_states(
             path_advs = tree_advs[path_local_mask]
             path_steps = tree_node_steps[path_local_mask]
 
-            # Backward cumulative mean: for each node, mean of advantages from it to the end of path
+            # Discounted backward cumulative mean: sum(γ^(t-k) * A_t) / remaining
+            # V^π(s_k) - G_k = -sum γ^(t-k) A_t is the expected improvement from branching at k
             n = len(path_advs)
             exploitation = torch.zeros_like(path_advs)
-            running_sum = 0.0
+            discounted_sum = 0.0
             for k in range(n - 1, -1, -1):
-                running_sum += path_advs[k].item()
-                exploitation[k] = running_sum / (n - k)
+                discounted_sum = path_advs[k].item() + args.gamma * discounted_sum
+                exploitation[k] = discounted_sum / (n - k)
 
             # Compute sibling counts for exploration term
             path_parents_vals = tree_parents[path_local_mask]
@@ -541,7 +542,7 @@ def select_next_states(
             min_path_idx = tuct.argmin().item()
             min_tuct_val = tuct[min_path_idx].item()
 
-            if min_path_idx >= n - 1:
+            if min_path_idx >= n - 2:
                 continue
 
             if min_tuct_val < best_tuct_val:
@@ -866,7 +867,7 @@ if __name__ == "__main__":
         prev_mean_return = mean_return
 
         # Save results to JSON file
-        algorithm_name = f"opts_ttpo_atari_20260225"
+        algorithm_name = f"opts_ttpo_atari_20260301"
         folder_name = f"./results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
         os.makedirs(folder_name, exist_ok=True)
         result_filename = f"{folder_name}/{args.env_id}_{args.seed}.json"
