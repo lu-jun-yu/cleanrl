@@ -675,9 +675,6 @@ def select_next_states(
             min_path_idx = tuct.argmin().item()
             min_tuct_val = tuct[min_path_idx].item()
 
-            if min_path_idx >= n - 2:
-                continue
-
             if min_tuct_val < best_tuct_val:
                 best_tuct_val = min_tuct_val
                 best_step_overall = path_steps[min_path_idx].item()
