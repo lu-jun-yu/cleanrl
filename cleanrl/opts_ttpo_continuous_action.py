@@ -602,7 +602,7 @@ def select_next_states(
             continue
 
         # For each tree, compute TUCT and find the best branching point
-        best_tuct_val = float('inf')
+        best_tuct_val = float('-inf')
         best_step_overall = None
         best_tree_id = None
         best_depth = None
@@ -649,13 +649,13 @@ def select_next_states(
             path_advs = tree_advs[path_local_mask]
             path_steps = tree_node_steps[path_local_mask]
 
-            # Discounted backward cumulative mean: sum(γ^(t-k) * A_t) / remaining
-            # V^π(s_k) - G_k = -sum γ^(t-k) A_t is the expected improvement from branching at k
+            # Expected improvement: -sum(γ^(t-k) * A_t) / remaining
+            # V^π(s_k) - G_k = -sum γ^(t-k) A_t, positive means improvement expected
             n = len(path_advs)
             exploitation = torch.zeros_like(path_advs)
             discounted_sum = 0.0
             for k in range(n - 1, -1, -1):
-                discounted_sum = path_advs[k].item() + args.gamma * discounted_sum
+                discounted_sum = -path_advs[k].item() + args.gamma * discounted_sum
                 exploitation[k] = discounted_sum / (n - k)
 
             # Compute sibling counts for exploration term
@@ -670,16 +670,16 @@ def select_next_states(
 
             exploration = (sibling_counts - 1) * max_abs_exploitation
 
-            tuct = exploitation + c * exploration
+            tuct = exploitation - c * exploration
 
-            min_path_idx = tuct.argmin().item()
-            min_tuct_val = tuct[min_path_idx].item()
+            max_path_idx = tuct.argmax().item()
+            max_tuct_val = tuct[max_path_idx].item()
 
-            if min_tuct_val < best_tuct_val:
-                best_tuct_val = min_tuct_val
-                best_step_overall = path_steps[min_path_idx].item()
+            if max_tuct_val > best_tuct_val:
+                best_tuct_val = max_tuct_val
+                best_step_overall = path_steps[max_path_idx].item()
                 best_tree_id = tid
-                best_depth = min_path_idx
+                best_depth = max_path_idx
                 best_path_len = len(path)
 
         # Decision: if best TUCT > 0 or no searchable tree, start new tree

@@ -119,11 +119,54 @@ episode 终止时，为该环境跨所有树全局选择最佳分支点。
 
 对于剩余的树，找到其最优路径：从 advantage 最大的根节点出发，每步贪心选择 advantage 最大的子节点，直到叶节点。
 
-沿最优路径计算 TUCT 值。exploitation 是 backward cumulative mean，即节点 k 的 exploitation 等于从 k 到路径末端所有 advantage 的均值，反映从该点开始的子路径整体质量。exploration 等于 (sibling_count - 1) * max_abs_exploitation，其中 sibling_count 是与该节点共享父节点的兄弟数量，max_abs_exploitation 是整条路径上 exploitation 绝对值的最大值（若为 0 则设为 1.0）。TUCT = exploitation + c * exploration。
+沿最优路径计算 TUCT 值。
 
-取路径上 TUCT 最小的节点作为候选分支点。若该节点位于路径的最后一个节点（即 min_path_idx >= path_length - 1），跳过这棵树。这一过滤的原因是：当 TUCT 最小值出现在末端时，说明整条最优路径的前半段表现尚可或已被充分探索，问题集中在末端，而末端的差表现通常是状态质量问题而非动作选择问题，从末端分支无法改善根本方向，且会浪费 search 预算。
+#### 5.2.1 exploitation（期望改善量）的数学推导
 
-遍历所有树后，选择全局 TUCT 最小的分支点。若无可选树（所有树都被跳过或搜索次数已满），开新树。
+**目标**：估计从节点 k 分支的期望改善 V^π(s_k) - G_k。
+
+**第一步：精确 telescoping 恒等式（纯代数，零近似）**
+
+定义 TD error δ_t = r_t + γ V(s_{t+1}) - V(s_t)。对 V(s_k) - G_k 在每步加减 γ^{t-k} V(s_t)：
+
+```
+V(s_k) - G_k = [V(s_k) - r_k - γV(s_{k+1})] + γ[V(s_{k+1}) - r_{k+1} - γV(s_{k+2})] + ...
+             = -δ_k - γδ_{k+1} - γ²δ_{k+2} - ...
+             = -sum_{t=k}^{T} γ^{t-k} δ_t + γ^{T-k+1} V(s_{T+1})
+```
+
+若 s_{T+1} 为终止状态，V(s_{T+1})=0，则 V(s_k) - G_k = -sum_{t=k}^{T} γ^{t-k} δ_t。此式对任意 V 成立，无需近似。
+
+**第二步：δ 与 A^π 的关系**
+
+真实优势 A^π(s,a) = Q^π(s,a) - V^π(s)。TD error δ_t = r_t + γV(s_{t+1}) - V(s_t)。对于具体转移，δ_t 是 A^π 的无偏但高方差的单样本估计：E[δ_t | s_t, a_t] = A^π(s_t, a_t)（当 V = V^π 时）。
+
+**第三步：用 GAE 替代 δ 提高稳定性**
+
+因为 V̂ ≠ V^π，单步 δ̂_t 依赖两个不准确的 V̂ 值做差，方差大。GAE Â_t = sum_l (γλ)^l δ_{t+l} 通过多步加权平均平滑了 V̂ 的误差，是 A^π 更稳定的估计器。
+
+将目标量分解为优势的加权和后，用 GAE 逐项替代：
+
+```
+V^π(s_k) - G_k = -sum_{t=k}^{T} γ^{t-k} A^π(s_t, a_t)
+               ≈ -sum_{t=k}^{T} γ^{t-k} Â_t^{GAE}
+```
+
+这不是声称代数恒等式对 GAE 成立，而是：目标量分解为各步优势的加权和，用最好的优势估计器（GAE）逐项逼近，得到更稳定的估计。
+
+**下游 advantage 的含义**：A_{k+1}, A_{k+2}, ... 不是在预测"分支后会经过什么状态"，而是在度量"原轨迹从该点开始比策略期望差了多少"。新分支的期望回报为 V^π(s_k)（按定义），原轨迹实际回报为 G_k，差值 V^π(s_k) - G_k 就是期望改善量，它恰好等于下游优势的折扣加权和的负值。
+
+**实际计算**：从后向前迭代 discounted_sum = -Â_k + γ * discounted_sum，再除以后续长度 (n-k) 得到单位预算期望改善。exploitation 为正值表示有改善空间。
+
+#### 5.2.2 exploration（搜索惩罚）
+
+等于 (sibling_count - 1) * max_abs_exploitation，其中 sibling_count 是与该节点共享父节点的兄弟数量，max_abs_exploitation 是整条路径上 exploitation 绝对值的最大值（若为 0 则设为 1.0）。
+
+#### 5.2.3 TUCT 与选择
+
+**TUCT = exploitation - c * exploration**。取路径上 TUCT 最大的节点（期望改善最大且未被过度搜索）作为候选分支点。
+
+遍历所有树后，选择全局 TUCT 最大的分支点。若无可选树（所有树都被跳过或搜索次数已满），开新树。
 
 ### 5.3 Branch Weight Factor
 
