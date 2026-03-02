@@ -149,6 +149,7 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    algorithm_name = f"{args.exp_name}_{datetime.now().strftime('%Y%m%d')}"
     if args.track:
         import wandb
 
@@ -241,7 +242,6 @@ if __name__ == "__main__":
         min_return = min(episodic_returns) if episodic_returns else 0.0
         print(f"Iteration {iteration}: mean_return={mean_return:.4f}, max_return={max_return:.4f}, min_return={min_return:.4f}")
 
-        algorithm_name = f"{args.exp_name}_{datetime.now().strftime('%Y%m%d')}"
         folder_name = f"./results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
         os.makedirs(folder_name, exist_ok=True)
         result_filename = f"{folder_name}/{args.env_id}_{args.seed}.json"

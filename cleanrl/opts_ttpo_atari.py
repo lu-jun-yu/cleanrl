@@ -570,6 +570,7 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    algorithm_name = f"{args.exp_name}_{datetime.now().strftime('%Y%m%d')}"
     if args.track:
         import wandb
 
@@ -864,7 +865,6 @@ if __name__ == "__main__":
         prev_mean_return = mean_return
 
         # Save results to JSON file
-        algorithm_name = f"opts_ttpo_atari_20260301"
         folder_name = f"./results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
         os.makedirs(folder_name, exist_ok=True)
         result_filename = f"{folder_name}/{args.env_id}_{args.seed}.json"
