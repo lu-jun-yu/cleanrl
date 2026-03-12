@@ -81,7 +81,7 @@ class Args:
     target_kl: float = None
     """the target KL divergence threshold"""
 
-    max_search_per_tree: int = 4
+    max_search_per_tree: int = 1
     """maximum number of tree searches per environment per iteration"""
     c: float = 1.0
     """exploration coefficient for TUCT node selection"""
@@ -854,12 +854,10 @@ if __name__ == "__main__":
             mean_return = sum(aggregated_returns) / len(aggregated_returns)
             max_return = max(aggregated_returns)
             min_return = min(aggregated_returns)
-            std_return = float(np.std(aggregated_returns)) if len(aggregated_returns) >= 2 else 0.0
         else:
             mean_return = 0.0
             max_return = 0.0
             min_return = 0.0
-            std_return = 0.0
         print(f"Iteration {iteration}: mean_return={mean_return:.4f}, max_return={max_return:.4f}, min_return={min_return:.4f}")
 
         prev_mean_return = mean_return
