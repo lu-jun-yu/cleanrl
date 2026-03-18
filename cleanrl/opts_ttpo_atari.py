@@ -81,7 +81,7 @@ class Args:
     target_kl: float = None
     """the target KL divergence threshold"""
 
-    max_search_per_tree: int = 1
+    max_search_per_tree: int = 4
     """maximum number of tree searches per environment per iteration"""
     c: float = 1.0
     """exploration coefficient for TUCT node selection"""
@@ -365,7 +365,7 @@ def compute_tree_gae(
         current = parent
 
 
-def compute_branch_weight_factors(
+def compute_branch_weight(
     num_steps: int,
     parent_indices: torch.Tensor,
     state_branches: torch.Tensor,
@@ -823,8 +823,8 @@ if __name__ == "__main__":
         # Compute returns: returns[t] = A(s_t, a_t) + V(s_t)
         returns = advantages + values
 
-        # Compute branch_weight_factors for all environments
-        branch_weights = compute_branch_weight_factors(
+        # Compute branch_weight for all environments
+        branch_weights = compute_branch_weight(
             num_steps=args.num_steps,
             parent_indices=parent_indices,
             state_branches=state_branches,

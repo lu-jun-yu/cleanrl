@@ -11,7 +11,7 @@ OPTS_TTPO（On-policy Parallel Tree Search + Tree Trajectory Policy Optimization
 | 轨迹结构 | 线性 | 树形，多棵树共存 |
 | 终止处理 | reset | TUCT 选择分支点或开新树 |
 | 优势估计 | GAE | TreeGAE，分支节点取子节点优势均值回传 |
-| 策略梯度 | 标准 | branch_weight_factor 加权校正 |
+| 策略梯度 | 标准 | branch_weight 加权校正 |
 | 跨迭代 | 每次全部 reset | 未终止 episode 自然延续到下一迭代 |
 
 ### 环境要求
@@ -43,11 +43,14 @@ state_branches 张量记录每个节点被分支的次数，初始为 1。当 TU
 
 root_states 是每个环境的列表，新根通过 insert(0, ...) 插入列表头部。parent_indices 中的负值通过 Python 负数索引映射到 root_states 列表：parent=-1 对应 root_states[-1]（最早创建的根），parent=-2 对应 root_states[-2]（第二棵树的根），依此类推。开新树时 current_parent 设为 -len(root_states)。
 
-root_branch_counts 字典记录每个根状态被分支的次数（即从同一根出发的一级节点数），用于计算根节点的 branch_weight。
-
 ### 每迭代辅助数据
 
-search_count 记录每棵树在本迭代已被搜索的次数，达到 max_search_per_tree 时不再对该树搜索。tree_max_returns 记录每棵树在本迭代的最大 episodic return，用于 TUCT 中的树跳过判断。episodic_return_info 记录本迭代所有终止 episode 的 return、tree_id、step 和 env_idx，用于计算 aggregated_returns。
+以下数据在每迭代开始时全部重新创建：
+
+- root_branch_counts：每个环境的字典，记录各根状态被分支的次数（即从同一根出发的一级节点数），用于计算根节点的 branch_weight。
+- search_count：每个环境的字典，记录每棵树在本迭代已被搜索的次数，达到 max_search_per_tree 时不再对该树搜索。
+- tree_max_returns：每个环境的字典，记录每棵树在本迭代的最大 episodic return，用于 TUCT 中的树跳过判断。
+- episodic_return_info：全局列表，记录本迭代所有终止 episode 的 (return, tree_id, step, env_idx) 四元组，用于计算 aggregated_returns。
 
 ### 环境状态快照
 
@@ -64,7 +67,7 @@ env_states 是二维列表（num_steps x num_envs），保存每步执行动作�
 
 ### 4.1 迭代初始化
 
-迭代开始时，只对上一迭代最后一步处于终止状态的环境执行 reset，未终止的环境保留 next_obs 和环境内部状态自然延续。所有环境都 clone 当前状态作为本迭代的根状态。然后重置 current_parent 为 -1、清零 advantages 和 next_done、重置 parent_indices 为 -1、重置 state_branches 为 1、清零 tree_indices。
+迭代开始时，只对上一迭代最后一步处于终止状态的环境执行 reset，未终止的环境保留 next_obs 和环境内部状态自然延续。所有环境都 clone 当前状态作为本迭代的根状态。然后重置树结构张量（current_parent 为 -1、parent_indices 为 -1、tree_indices 为 0、state_branches 为 1、advantages 为 0、next_done 为 0），并重新创建所有每迭代辅助数据（root_branch_counts、search_count、tree_max_returns、episodic_return_info）。
 
 延续的环境在第一步的 parent_indices 为 -1，因此 tree_id 也为 -1，与正常开新树的行为一致。延续 episode 的 RecordEpisodeStatistics 累计值在 wrapper 中自然保持，终止时报告完整的 episodic return。
 
@@ -78,7 +81,11 @@ env_states 是二维列表（num_steps x num_envs），保存每步执行动作�
 
 **执行动作。** 所有环境执行 action，收集 next_obs、reward、done，保存状态快照到 env_states[step]。若 episode 终止，记录 episodic return 并更新 tree_max_returns。
 
-**处理终止环境。** 对所有终止的环境依次执行：先调用 TreeGAE 从终止节点回溯更新 advantages；再调用 TUCT 选择下一步操作；最后根据选择结果恢复状态。
+**处理终止环境。** 分三阶段处理所有终止的环境：
+
+1. **TreeGAE 阶段**：对每个终止环境分别调用 TreeGAE，从终止节点回溯更新 advantages（next_value=0）。
+2. **TUCT 选择阶段**：将所有终止环境的索引批量传入 select_next_states，一次性为每个环境选择下一步操作。
+3. **状态恢复阶段**：逐个根据选择结果恢复环境状态。
 
 若 TUCT 返回负值（开新树），reset 环境，将新根插入 root_states 头部，设置 current_parent 为对应的负索引。
 
@@ -90,7 +97,7 @@ env_states 是二维列表（num_steps x num_envs），保存每步执行动作�
 
 计算 returns = advantages + values。
 
-计算 branch_weight_factors。
+计算 branch_weight。
 
 按 (env_idx, tree_id) 分组，对本迭代所有终止 episode 的 return 进行 branch_weight 加权平均，得到 aggregated_returns，进而计算 mean_return。将 mean_return 直接作为下一迭代 TUCT 的 return_threshold（prev_mean_return = mean_return）。
 
@@ -143,7 +150,7 @@ V(s_k) - G_k = [V(s_k) - r_k - γV(s_{k+1})] + γ[V(s_{k+1}) - r_{k+1} - γV(s_{
 
 **第三步：用 GAE 替代 δ 提高稳定性**
 
-因为 V̂ ≠ V^π，单步 δ̂_t 依赖两个不准确的 V̂ 值做差，方差大。GAE Â_t = sum_l (γλ)^l δ_{t+l} 通过多步加权平均平滑了 V̂ 的误差，是 A^π 更稳定的估计器。
+因为 V̂ ≠ V^π，单步 δ̂_t 依赖两个不准确的 V̂ 值做差，偏差大。GAE Â_t = sum_l (γλ)^l δ_{t+l} 通过多步加权平均平滑了 V̂ 的误差，是 A^π 更稳定的估计器。
 
 将目标量分解为优势的加权和后，用 GAE 逐项替代：
 
@@ -160,13 +167,13 @@ V^π(s_k) - G_k = -sum_{t=k}^{T} γ^{t-k} A^π(s_t, a_t)
 
 #### 5.2.2 exploration（搜索惩罚）
 
-等于 (sibling_count - 1) * max_abs_exploitation，其中 sibling_count 是与该节点共享父节点的兄弟数量，max_abs_exploitation 是整条路径上 exploitation 绝对值的最大值（若为 0 则设为 1.0）。
+等于 (sibling_count - 1) * max_abs_exploitation，其中 sibling_count 是共享同一父节点的全部子节点数（包含节点自身），因此 (sibling_count - 1) 表示该父节点已被分支探索的额外次数。max_abs_exploitation 是整条路径上 exploitation 绝对值的最大值（若为 0 则设为 1.0），用于将 exploration 项标准化到与 exploitation 同一量级。
 
 #### 5.2.3 TUCT 与选择
 
 **TUCT = exploitation - c * exploration**。取路径上 TUCT 最大的节点（期望改善最大且未被过度搜索）作为候选分支点。
 
-遍历所有树后，选择全局 TUCT 最大的分支点。若无可选树（所有树都被跳过或搜索次数已满），开新树。
+遍历所有树后，选择全局 TUCT 最大的分支点。只要存在任何可搜索的树（未被跳过且搜索次数未满），就一定选择分支，不检查 TUCT 值正负。仅当所有树都被跳过（搜索次数已满或 max return 超过阈值）时才开新树。
 
 ### 5.3 Branch Weight Factor
 
@@ -191,11 +198,90 @@ pg_loss = sum(clip_loss_i / W_i) / sum(1 / W_i)
 v_loss  = sum(value_loss_i / W_i) / sum(1 / W_i)
 ```
 
-这确保了被多次经过的节点不会在梯度中被过度表示。
+entropy_loss 不进行 branch_weight 加权，直接取简单均值：
+
+```
+entropy_loss = mean(entropy_i)
+loss = pg_loss - ent_coef * entropy_loss + vf_coef * v_loss
+```
+
+这确保了被多次经过的节点不会在策略梯度和价值回归中被过度表示，而熵正则化保持对所有节点的均匀鼓励。
 
 
 ## 6. 实现要点
 
-不能使用 SyncVectorEnv，因为需要单独操控每个环境的 clone/restore 状态，使用独立环境列表。
+### 6.1 环境管理
 
-环境创建时最外层包裹 StateSnapshotWrapper（MuJoCo 或 Atari 版本），在其内部自动查找并定位 TimeLimit、RecordEpisodeStatistics、NormalizeObservation、NormalizeReward 等 wrapper，确保 clone/restore 时完整保存和恢复所有 wrapper 状态。
+不能使用 SyncVectorEnv，因为树搜索需要单独操控每个环境的 clone/restore 状态。使用独立环境列表 `envs = [make_env(...)() for i in range(num_envs)]`，所有环境循环在 Python 层逐个执行。
+
+### 6.2 StateSnapshotWrapper
+
+环境创建时最外层包裹 StateSnapshotWrapper（Atari 或 MuJoCo 版本），提供 `clone_state()` 和 `restore_state(state)` 接口。wrapper 初始化时沿 `env` 链自动查找并缓存内部各层 wrapper 的引用，确保 clone/restore 时完整保存和恢复所有 wrapper 状态。
+
+#### episode 统计值的快照时序问题
+
+RecordEpisodeStatistics 在 episode 终止时先将累计值写入 `info['episode']`，然后立即将内部计数器 `episode_returns` / `episode_lengths` 归零。如果在终止后直接读取计数器，得到的是归零后的值而非真实累计值。
+
+StateSnapshotWrapper 通过在自身的 `step()` 方法中维护 `_episode_return_snapshot` / `_episode_length_snapshot` 解决此问题：
+- episode 未终止时，从 `RecordEpisodeStatistics.episode_returns[0]` 读取当前累计值。
+- episode 终止时，从 `info['episode']` 中提取终止前的真实累计值。
+- `clone_state()` 保存的是 snapshot 值而非直接读计数器，确保恢复后累计值正确。
+- `reset()` 时将 snapshot 归零。
+
+#### Atari（AtariStateSnapshotWrapper）
+
+保存和恢复以下状态：
+
+| 组件 | 保存内容 |
+|------|----------|
+| ALE | `ale.cloneState()` / `ale.restoreState()`，包含 RAM、寄存器等全部模拟器状态 |
+| FrameStack | `frames` deque 中所有帧的深拷贝，恢复时 clear 后逐帧 append |
+| MaxAndSkipEnv | `_obs_buffer` 数组的深拷贝 |
+| EpisodicLifeEnv | `lives` 和 `was_real_done` 标志 |
+| TimeLimit | `_elapsed_steps` |
+| RecordEpisodeStatistics | 通过 snapshot 机制保存的累计 return/length |
+
+Atari 环境 wrapper 链（从内到外）：`gym.make` → `RecordEpisodeStatistics` → `NoopResetEnv` → `MaxAndSkipEnv(skip=4)` → `EpisodicLifeEnv` → `FireResetEnv`（若适用）→ `ClipRewardEnv` → `ResizeObservation(84,84)` → `GrayScaleObservation` → `FrameStack(4)` → `AtariStateSnapshotWrapper`。
+
+#### MuJoCo（MuJoCoStateSnapshotWrapper）
+
+保存和恢复以下状态：
+
+| 组件 | 保存内容 |
+|------|----------|
+| mjData 核心 | `qpos`、`qvel`、`time` |
+| mjData 可选输入 | `act`、`qacc`、`ctrl`、`qfrc_applied`、`xfrc_applied` 等（存在且非空时保存） |
+| mjData 派生量 | `xpos`、`xquat`、`xmat`、`xipos`、`site_xpos`、`subtree_com`、`cinert`、`cvel` 等 |
+| Mocap 体 | `mocap_pos`、`mocap_quat`（Reacher 等环境使用） |
+| 环境 Python 属性 | `_last_x_position`（HalfCheetah）、`_last_position`、`_init_obs` 等影响奖励/观测的属性 |
+| 目标 | `env.goal`（Reacher 等目标条件环境） |
+| RNG 状态 | `np_random.bit_generator.state`（含随机目标的环境需要） |
+| TimeLimit | `_elapsed_steps` |
+| RecordEpisodeStatistics | 通过 snapshot 机制保存的累计 return/length |
+| NormalizeObservation | `obs_rms` 的 mean、var、count |
+| NormalizeReward | `return_rms` 的 mean、var、count 以及 `returns` 累加器 |
+
+**派生量的恢复顺序**：Gymnasium MuJoCo 环境在 `_get_obs()` 中使用的是 `mj_step` 积分前计算的"陈旧"派生量（如 `site_xpos`、`cfrc_ext`）。恢复时的三步操作确保观测一致性：
+
+1. 先恢复所有 mjData 字段（qpos、qvel、ctrl 等）
+2. 调用 `mujoco.mj_forward(model, data)` 重算派生量
+3. 再用保存的派生量覆盖 `mj_forward` 的结果，还原到保存时的"陈旧"值
+
+MuJoCo 环境 wrapper 链（从内到外）：`gym.make` → `FlattenObservation` → `RecordEpisodeStatistics` → `ClipAction` → `NormalizeObservation` → `TransformObservation(clip ±10)` → `NormalizeReward(gamma)` → `TransformReward(clip ±10)` → `MuJoCoStateSnapshotWrapper`。
+
+### 6.3 两个实现变体的差异
+
+核心算法（TreeGAE、TUCT、branch_weight、aggregated_returns、加权 PPO 更新）在 Atari 和 MuJoCo 两个实现中完全一致，差异仅在于环境接口适配层：
+
+| 差异项 | Atari (`opts_ttpo_atari.py`) | MuJoCo (`opts_ttpo_continuous_action.py`) |
+|--------|------------------------------|-------------------------------------------|
+| 动作空间 | Discrete，Categorical 分布采样 | Box，Normal 分布采样（actor_mean + actor_logstd） |
+| 网络结构 | CNN（3 层 Conv2d → Linear(512)）| MLP（2 层 Linear(64) + Tanh） |
+| 观测预处理 | 网络内 `x / 255.0` 归一化 | 环境层 NormalizeObservation + clip ±10 |
+| 奖励预处理 | ClipRewardEnv（clip 到 {-1,0,1}）| NormalizeReward + clip ±10 |
+| 快照实现 | ALE cloneState/restoreState | mjData 字段深拷贝 + mj_forward + 派生量覆盖 |
+| 需保存的 wrapper 状态 | FrameStack、MaxAndSkipEnv、EpisodicLifeEnv | NormalizeObservation、NormalizeReward（含 running statistics） |
+
+### 6.4 结果保存
+
+每迭代结束后将 aggregated_returns 的统计量（mean_return、max_return、min_return）追加写入 JSON 文件，路径为 `./results/{num_envs}_{num_steps}/{algorithm_name}/{env_id}_{seed}.json`。`algorithm_name` 格式为 `{exp_name}_{YYYYMMDD}`。同时通过 TensorBoard（SummaryWriter）记录 episodic_return、episodic_length、loss 等指标，可选启用 wandb 同步。
