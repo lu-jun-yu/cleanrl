@@ -560,6 +560,7 @@ def select_next_states(
     c: float = 1.0,
     tree_max_returns: list[dict] = None,
     return_threshold: float = None,
+    gamma: float = 0.99,
 ) -> list[int]:
     """
     Select which tree to search and which node to branch from.
@@ -655,7 +656,7 @@ def select_next_states(
             exploitation = torch.zeros_like(path_advs)
             discounted_sum = 0.0
             for k in range(n - 1, -1, -1):
-                discounted_sum = -path_advs[k].item() + args.gamma * discounted_sum
+                discounted_sum = -path_advs[k].item() + gamma * discounted_sum
                 exploitation[k] = discounted_sum / (n - k)
 
             # Compute sibling counts for exploration term
@@ -911,6 +912,7 @@ if __name__ == "__main__":
                     c=args.c,
                     tree_max_returns=tree_max_returns,
                     return_threshold=prev_mean_return,
+                    gamma=args.gamma,
                 )
 
                 # TUCT selection and state restoration
@@ -1050,7 +1052,6 @@ if __name__ == "__main__":
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss_per_sample = torch.max(pg_loss1, pg_loss2)
                 mb_weights = b_weights[mb_inds]
-                # pg_loss = pg_loss_per_sample.mean()
                 pg_loss = (pg_loss_per_sample / mb_weights).sum() / (1.0 / mb_weights).sum()
 
                 # Value loss (weighted by branch factors)
@@ -1064,11 +1065,9 @@ if __name__ == "__main__":
                     )
                     v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    # v_loss = 0.5 * v_loss_max.mean()
                     v_loss = 0.5 * (v_loss_max / mb_weights).sum() / (1.0 / mb_weights).sum()
                 else:
                     v_loss_per_sample = (newvalue - b_returns[mb_inds]) ** 2
-                    # v_loss = 0.5 * v_loss_per_sample.mean()
                     v_loss = 0.5 * (v_loss_per_sample / mb_weights).sum() / (1.0 / mb_weights).sum()
 
                 entropy_loss = entropy.mean()
@@ -1103,6 +1102,26 @@ if __name__ == "__main__":
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
         torch.save(agent.state_dict(), model_path)
         print(f"model saved to {model_path}")
+
+        # Save complete checkpoint (model weights + normalization running stats)
+        checkpoint = {"model_state_dict": agent.state_dict()}
+        env0 = envs[0]
+        if env0._normalize_obs_wrapper is not None and hasattr(env0._normalize_obs_wrapper, "obs_rms"):
+            obs_rms = env0._normalize_obs_wrapper.obs_rms
+            checkpoint["obs_rms_mean"] = np.array(obs_rms.mean, copy=True)
+            checkpoint["obs_rms_var"] = np.array(obs_rms.var, copy=True)
+            checkpoint["obs_rms_count"] = float(obs_rms.count)
+        if env0._normalize_reward_wrapper is not None and hasattr(env0._normalize_reward_wrapper, "return_rms"):
+            ret_rms = env0._normalize_reward_wrapper.return_rms
+            checkpoint["ret_rms_mean"] = np.array(ret_rms.mean, copy=True)
+            checkpoint["ret_rms_var"] = np.array(ret_rms.var, copy=True)
+            checkpoint["ret_rms_count"] = float(ret_rms.count)
+        ckpt_dir = f"checkpoints/{args.env_id}"
+        os.makedirs(ckpt_dir, exist_ok=True)
+        ckpt_path = f"{ckpt_dir}/seed{args.seed}.pt"
+        torch.save(checkpoint, ckpt_path)
+        print(f"complete checkpoint saved to {ckpt_path}")
+
         from cleanrl_utils.evals.ppo_eval import evaluate
 
         episodic_returns = evaluate(

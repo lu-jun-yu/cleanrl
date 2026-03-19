@@ -427,6 +427,7 @@ def select_next_states(
     c: float = 1.0,
     tree_max_returns: list[dict] = None,
     return_threshold: float = None,
+    gamma: float = 0.99,
 ) -> list[int]:
     """
     Select which tree to search and which node to branch from.
@@ -522,7 +523,7 @@ def select_next_states(
             exploitation = torch.zeros_like(path_advs)
             discounted_sum = 0.0
             for k in range(n - 1, -1, -1):
-                discounted_sum = -path_advs[k].item() + args.gamma * discounted_sum
+                discounted_sum = -path_advs[k].item() + gamma * discounted_sum
                 exploitation[k] = discounted_sum / (n - k)
 
             # Compute sibling counts for exploration term
@@ -778,6 +779,7 @@ if __name__ == "__main__":
                     c=args.c,
                     tree_max_returns=tree_max_returns,
                     return_threshold=prev_mean_return,
+                    gamma=args.gamma,
                 )
 
                 # TUCT selection and state restoration
