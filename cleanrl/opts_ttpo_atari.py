@@ -295,7 +295,7 @@ class Agent(nn.Module):
             layer_init(nn.Linear(64 * 7 * 7, 512)),
             nn.ReLU(),
         )
-        self.actor = layer_init(nn.Linear(512, envs[0].action_space.n), std=0.01)
+        self.actor = layer_init(nn.Linear(512, envs.single_action_space.n), std=0.01)
         self.critic = layer_init(nn.Linear(512, 1), std=1)
 
     def get_value(self, x):
@@ -602,7 +602,12 @@ if __name__ == "__main__":
     envs = [make_env(args.env_id, i, args.capture_video, run_name)() for i in range(args.num_envs)]
     assert isinstance(envs[0].action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    agent = Agent(envs).to(device)
+    # SyncVectorEnv for Agent init (cleanrl convention), envs list for actual training
+    envs_vec = gym.vector.SyncVectorEnv(
+        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)]
+    )
+    agent = Agent(envs_vec).to(device)
+    envs_vec.close()
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup

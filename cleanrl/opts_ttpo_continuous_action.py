@@ -415,20 +415,20 @@ class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs[0].observation_space.shape).prod(), 64)),
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 1), std=1.0),
         )
         self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs[0].observation_space.shape).prod(), 64)),
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, np.prod(envs[0].action_space.shape)), std=0.01),
+            layer_init(nn.Linear(64, np.prod(envs.single_action_space.shape)), std=0.01),
         )
-        self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs[0].action_space.shape)))
+        self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
 
     def get_value(self, x):
         return self.critic(x)
@@ -735,7 +735,12 @@ if __name__ == "__main__":
     envs = [make_env(args.env_id, i, args.capture_video, run_name, args.gamma)() for i in range(args.num_envs)]
     assert isinstance(envs[0].action_space, gym.spaces.Box), "only continuous action space is supported"
 
-    agent = Agent(envs).to(device)
+    # SyncVectorEnv for Agent init (cleanrl convention), envs list for actual training
+    envs_vec = gym.vector.SyncVectorEnv(
+        [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
+    )
+    agent = Agent(envs_vec).to(device)
+    envs_vec.close()
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
