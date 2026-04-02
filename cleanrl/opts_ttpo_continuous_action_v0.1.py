@@ -1,4 +1,4 @@
-# OPTS_TTPO (On-Policy Parallel Tree Search + Tree Trajectory Policy Optimization) for Atari
+# OPTS_TTPO (On-Policy Parallel Tree Search + Tree Trajectory Policy Optimization) for Continuous Action
 # Based on PPO implementation from CleanRL
 import os
 import random
@@ -6,7 +6,7 @@ import time
 import json
 from datetime import datetime
 from dataclasses import dataclass
-from typing import List
+from typing import Any, List
 
 import gymnasium as gym
 import numpy as np
@@ -14,16 +14,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import tyro
-from torch.distributions.categorical import Categorical
+from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
-
-from cleanrl_utils.atari_wrappers import (  # isort:skip
-    ClipRewardEnv,
-    EpisodicLifeEnv,
-    FireResetEnv,
-    MaxAndSkipEnv,
-    NoopResetEnv,
-)
 
 
 @dataclass
@@ -44,17 +36,23 @@ class Args:
     """the entity (team) of wandb's project"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
+    save_model: bool = False
+    """whether to save model into the `runs/{run_name}` folder"""
+    upload_model: bool = False
+    """whether to upload the saved model to huggingface"""
+    hf_entity: str = ""
+    """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
-    env_id: str = "BreakoutNoFrameskip-v4"
+    env_id: str = "HalfCheetah-v4"
     """the id of the environment"""
-    total_timesteps: int = 10000000
+    total_timesteps: int = 1000000
     """total timesteps of the experiments"""
-    learning_rate: float = 2.5e-4
+    learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 8
+    num_envs: int = 1
     """the number of parallel game environments"""
-    num_steps: int = 128
+    num_steps: int = 2048
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
@@ -62,17 +60,17 @@ class Args:
     """the discount factor gamma"""
     gae_lambda: float = 0.95
     """the lambda for the general advantage estimation"""
-    num_minibatches: int = 4
+    num_minibatches: int = 32
     """the number of mini-batches"""
-    update_epochs: int = 4
+    update_epochs: int = 10
     """the K epochs to update the policy"""
     norm_adv: bool = True
     """Toggles advantages normalization"""
-    clip_coef: float = 0.1
+    clip_coef: float = 0.2
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.01
+    ent_coef: float = 0.0
     """coefficient of the entropy"""
     vf_coef: float = 0.5
     """coefficient of the value function"""
@@ -95,41 +93,27 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
 
-class AtariStateSnapshotWrapper(gym.Wrapper):
-    """Wrapper to support state snapshots for Atari environments using ALE.
-
-    Saves and restores:
-    - ALE simulator state (RAM, registers, etc.)
-    - FrameStack buffer (critical for correct observations)
-    - MaxAndSkipEnv observation buffer
-    - EpisodicLifeEnv life tracking state
-    - TimeLimit elapsed steps
-    - RecordEpisodeStatistics counters
-    """
+class MuJoCoStateSnapshotWrapper(gym.Wrapper):
+    """Wrapper to support state snapshots for MuJoCo environments."""
 
     def __init__(self, env):
         super().__init__(env)
-        self.ale = self.unwrapped.ale
-
-        # Find all wrappers that need state saved/restored
+        # Find TimeLimit and RecordEpisodeStatistics wrappers
         self._timelimit_wrapper = None
         self._record_stats_wrapper = None
-        self._framestack_wrapper = None
-        self._maxandskip_wrapper = None
-        self._episodiclife_wrapper = None
-
+        self._normalize_obs_wrapper = None
+        self._normalize_reward_wrapper = None
         current = env
         while current is not None:
             if hasattr(current, '_elapsed_steps'):  # TimeLimit wrapper
                 self._timelimit_wrapper = current
             if hasattr(current, 'episode_returns'):  # RecordEpisodeStatistics wrapper
                 self._record_stats_wrapper = current
-            if hasattr(current, 'frames') and hasattr(current, 'num_stack'):  # FrameStack wrapper
-                self._framestack_wrapper = current
-            if hasattr(current, '_obs_buffer') and hasattr(current, '_skip'):  # MaxAndSkipEnv wrapper
-                self._maxandskip_wrapper = current
-            if hasattr(current, 'lives') and hasattr(current, 'was_real_done'):  # EpisodicLifeEnv wrapper
-                self._episodiclife_wrapper = current
+            # Normalization wrappers keep internal running statistics; they must be snapshotted too
+            if isinstance(current, gym.wrappers.NormalizeObservation):
+                self._normalize_obs_wrapper = current
+            if isinstance(current, gym.wrappers.NormalizeReward):
+                self._normalize_reward_wrapper = current
             current = getattr(current, 'env', None)
 
         # Track RecordEpisodeStatistics values for state snapshot
@@ -169,8 +153,90 @@ class AtariStateSnapshotWrapper(gym.Wrapper):
         return obs, info
 
     def clone_state(self):
-        """Clone the current environment state including all wrapper states."""
-        ale_state = self.ale.cloneState()
+        """Clone the current environment state including wrapper states.
+        
+        Copies all key mjData fields to ensure complete state restoration.
+        Also saves derived quantities (xpos, site_xpos, etc.) which are needed
+        because Gymnasium MuJoCo envs return observations using "stale" derived
+        quantities computed before qpos/qvel integration in mj_step.
+        """
+        env = self.unwrapped
+        data = env.data
+        
+        # Copy all key mjData fields (covers physics state + derived quantities)
+        mj_state = {
+            'qpos': data.qpos.copy(),
+            'qvel': data.qvel.copy(),
+            'time': float(data.time),
+        }
+        
+        # Optional input fields that may exist
+        optional_fields = [
+            'act', 'qacc', 'qacc_warmstart', 'qfrc_applied', 'xfrc_applied',
+            'ctrl', 'qfrc_actuator', 'qfrc_bias', 'qfrc_constraint',
+            'qacc_smooth', 'qfrc_inverse',
+            # Contacts and derived quantities (important for reward calculation)
+            'cfrc_int', 'cfrc_ext',
+        ]
+        for field in optional_fields:
+            if hasattr(data, field):
+                arr = getattr(data, field)
+                if arr is not None and hasattr(arr, 'copy') and arr.size > 0:
+                    mj_state[field] = arr.copy()
+        
+        # Mocap bodies (for Reacher-like envs)
+        if hasattr(data, 'mocap_pos') and data.mocap_pos is not None and data.mocap_pos.size > 0:
+            mj_state['mocap_pos'] = data.mocap_pos.copy()
+        if hasattr(data, 'mocap_quat') and data.mocap_quat is not None and data.mocap_quat.size > 0:
+            mj_state['mocap_quat'] = data.mocap_quat.copy()
+        
+        # Save derived quantities needed for observation calculation
+        # These are computed by mj_forward/mj_step1 based on qpos/qvel BEFORE integration
+        # Gymnasium envs use these "stale" values in _get_obs() after step()
+        derived_fields = [
+            'xpos', 'xquat', 'xmat',           # Body positions/orientations
+            'xipos', 'ximat',                   # Body inertia positions
+            'site_xpos', 'site_xmat',           # Site positions (used by Reacher)
+            'subtree_com',                      # Subtree center of mass (used by get_body_com)
+            'cinert', 'cvel', 'cacc',           # Composite body inertia/velocity/acceleration
+            'cdof', 'cdof_dot',                 # DoF-related derivatives (Humanoid)
+        ]
+        derived_state = {}
+        for field in derived_fields:
+            if hasattr(data, field):
+                arr = getattr(data, field)
+                if arr is not None and hasattr(arr, 'copy') and arr.size > 0:
+                    derived_state[field] = arr.copy()
+        
+        # Save goal for goal-conditioned envs like Reacher-v4
+        goal = None
+        try:
+            if hasattr(env, "goal") and env.goal is not None:
+                goal = np.array(env.goal, copy=True)
+        except Exception:
+            goal = None
+
+        # Save RNG state (important for envs with per-episode random goals)
+        rng_state = None
+        try:
+            if hasattr(env, "np_random") and env.np_random is not None:
+                rng_state = env.np_random.bit_generator.state
+        except Exception:
+            rng_state = None
+        
+        # Save environment-specific Python attributes that affect reward/obs
+        env_attrs = {}
+        try:
+            for attr_name in ['_last_x_position', '_last_position', '_init_obs']:
+                if hasattr(env, attr_name):
+                    val = getattr(env, attr_name)
+                    if val is not None:
+                        if hasattr(val, 'copy'):
+                            env_attrs[attr_name] = val.copy()
+                        else:
+                            env_attrs[attr_name] = val
+        except Exception:
+            pass
 
         # Save TimeLimit state
         timelimit_steps = None
@@ -183,42 +249,113 @@ class AtariStateSnapshotWrapper(gym.Wrapper):
             'episode_lengths': self._episode_length_snapshot,
         }
 
-        # Save FrameStack buffer (critical for correct observations)
-        framestack_state = None
-        if self._framestack_wrapper is not None:
-            # self.frames is a deque of LazyFrames or arrays
-            frames_list = []
-            for frame in self._framestack_wrapper.frames:
-                if hasattr(frame, '__array__'):
-                    frames_list.append(np.array(frame, copy=True))
-                else:
-                    frames_list.append(frame)
-            framestack_state = frames_list
-
-        # Save MaxAndSkipEnv buffer
-        maxandskip_state = None
-        if self._maxandskip_wrapper is not None:
-            maxandskip_state = [
-                np.array(obs, copy=True) if obs is not None else None
-                for obs in self._maxandskip_wrapper._obs_buffer
-            ]
-
-        # Save EpisodicLifeEnv state
-        episodiclife_state = None
-        if self._episodiclife_wrapper is not None:
-            episodiclife_state = {
-                'lives': self._episodiclife_wrapper.lives,
-                'was_real_done': self._episodiclife_wrapper.was_real_done,
+        # Save normalization wrapper states (RunningMeanStd + discounted return accumulator)
+        norm_obs_state = None
+        if self._normalize_obs_wrapper is not None and hasattr(self._normalize_obs_wrapper, "obs_rms"):
+            obs_rms = self._normalize_obs_wrapper.obs_rms
+            norm_obs_state = {
+                "mean": np.array(obs_rms.mean, copy=True),
+                "var": np.array(obs_rms.var, copy=True),
+                "count": float(obs_rms.count),
             }
+        norm_reward_state = None
+        if self._normalize_reward_wrapper is not None:
+            state = {}
+            if hasattr(self._normalize_reward_wrapper, "return_rms") and self._normalize_reward_wrapper.return_rms is not None:
+                rr = self._normalize_reward_wrapper.return_rms
+                state["return_rms"] = {
+                    "mean": np.array(rr.mean, copy=True),
+                    "var": np.array(rr.var, copy=True),
+                    "count": float(rr.count),
+                }
+            if hasattr(self._normalize_reward_wrapper, "returns"):
+                # returns can be scalar or array depending on wrapper version
+                rets = self._normalize_reward_wrapper.returns
+                state["returns"] = np.array(rets, copy=True) if hasattr(rets, "__array__") else float(rets)
+            norm_reward_state = state if len(state) > 0 else None
 
-        return (ale_state, timelimit_steps, record_stats, framestack_state, maxandskip_state, episodiclife_state)
+        return (mj_state, goal, rng_state, timelimit_steps, record_stats, norm_obs_state, norm_reward_state, env_attrs, derived_state)
 
     def restore_state(self, state):
-        """Restore the environment to a previous state including all wrapper states."""
-        ale_state, timelimit_steps, record_stats, framestack_state, maxandskip_state, episodiclife_state = state
+        """Restore the environment to a previous state including wrapper states.
+        
+        Restores all key mjData fields for complete state restoration.
+        Key fix: Restore all fields BEFORE calling mj_forward to ensure derived
+        quantities (site positions, contact forces, etc.) are computed correctly.
+        Then restore the saved derived quantities to match Gymnasium's behavior
+        where observations use "stale" derived values from before integration.
+        """
+        import mujoco
+        
+        mj_state, goal, rng_state, timelimit_steps, record_stats, norm_obs_state, norm_reward_state, env_attrs, derived_state = state
+        
+        env = self.unwrapped
+        data = env.data
+        model = env.model
+        
+        # Step 1: Restore all mjData fields FIRST (before mj_forward)
+        # Restore qpos and qvel directly (not through set_state yet)
+        data.qpos[:] = mj_state['qpos']
+        data.qvel[:] = mj_state['qvel']
+        data.time = mj_state['time']
+        
+        # Restore all other mjData fields (including mocap_pos, ctrl, etc.)
+        for field, value in mj_state.items():
+            if field in ('qpos', 'qvel', 'time'):
+                continue  # Already restored
+            if hasattr(data, field):
+                target = getattr(data, field)
+                if target is not None and hasattr(target, '__setitem__'):
+                    try:
+                        target[:] = value
+                    except Exception:
+                        pass
+        
+        # Restore goal for goal-conditioned envs like Reacher-v4
+        # Must be done BEFORE mj_forward for environments that use goal in observations
+        try:
+            if goal is not None and hasattr(env, "goal"):
+                env.goal = np.array(goal, copy=True)
+        except Exception:
+            pass
+        
+        # Step 2: Call mj_forward to recompute all derived quantities
+        # This ensures site_xpos, xipos, subtree_com, cfrc_int, cfrc_ext, etc. are correct
+        mujoco.mj_forward(model, data)
+        
+        # Step 3: Restore saved derived quantities AFTER mj_forward
+        # This is needed because Gymnasium MuJoCo envs return observations using
+        # "stale" derived quantities computed BEFORE qpos/qvel integration in mj_step.
+        # Without this, the observation immediately after restore won't match the
+        # observation at save time (though subsequent steps will be deterministic).
+        if derived_state:
+            for field, value in derived_state.items():
+                if hasattr(data, field):
+                    target = getattr(data, field)
+                    if target is not None and hasattr(target, '__setitem__'):
+                        try:
+                            target[:] = value
+                        except Exception:
+                            pass
+        
+        # Restore environment-specific Python attributes
+        try:
+            if env_attrs:
+                for attr_name, val in env_attrs.items():
+                    if hasattr(env, attr_name):
+                        if hasattr(val, 'copy'):
+                            setattr(env, attr_name, val.copy())
+                        else:
+                            setattr(env, attr_name, val)
+        except Exception:
+            pass
 
-        # Restore ALE state first
-        self.ale.restoreState(ale_state)
+        # Restore RNG state
+        try:
+            if rng_state is not None and hasattr(self.unwrapped, "np_random") and self.unwrapped.np_random is not None:
+                self.unwrapped.np_random.bit_generator.state = rng_state
+        except Exception:
+            pass
 
         # Restore TimeLimit state
         if self._timelimit_wrapper is not None and timelimit_steps is not None:
@@ -232,44 +369,37 @@ class AtariStateSnapshotWrapper(gym.Wrapper):
             self._episode_return_snapshot = record_stats['episode_returns']
             self._episode_length_snapshot = record_stats['episode_lengths']
 
-        # Restore FrameStack buffer (critical for correct observations)
-        if self._framestack_wrapper is not None and framestack_state is not None:
-            self._framestack_wrapper.frames.clear()
-            for frame in framestack_state:
-                self._framestack_wrapper.frames.append(frame)
-
-        # Restore MaxAndSkipEnv buffer
-        if self._maxandskip_wrapper is not None and maxandskip_state is not None:
-            for i, obs in enumerate(maxandskip_state):
-                if obs is not None:
-                    self._maxandskip_wrapper._obs_buffer[i] = np.array(obs, copy=True)
-                else:
-                    self._maxandskip_wrapper._obs_buffer[i] = None
-
-        # Restore EpisodicLifeEnv state
-        if self._episodiclife_wrapper is not None and episodiclife_state is not None:
-            self._episodiclife_wrapper.lives = episodiclife_state['lives']
-            self._episodiclife_wrapper.was_real_done = episodiclife_state['was_real_done']
+        # Restore normalization statistics
+        if self._normalize_obs_wrapper is not None and norm_obs_state is not None and hasattr(self._normalize_obs_wrapper, "obs_rms"):
+            obs_rms = self._normalize_obs_wrapper.obs_rms
+            obs_rms.mean = np.array(norm_obs_state["mean"], copy=True)
+            obs_rms.var = np.array(norm_obs_state["var"], copy=True)
+            obs_rms.count = float(norm_obs_state["count"])
+        if self._normalize_reward_wrapper is not None and norm_reward_state is not None:
+            if "return_rms" in norm_reward_state and hasattr(self._normalize_reward_wrapper, "return_rms") and self._normalize_reward_wrapper.return_rms is not None:
+                rr = self._normalize_reward_wrapper.return_rms
+                rr.mean = np.array(norm_reward_state["return_rms"]["mean"], copy=True)
+                rr.var = np.array(norm_reward_state["return_rms"]["var"], copy=True)
+                rr.count = float(norm_reward_state["return_rms"]["count"])
+            if "returns" in norm_reward_state and hasattr(self._normalize_reward_wrapper, "returns"):
+                self._normalize_reward_wrapper.returns = norm_reward_state["returns"]
 
 
-def make_env(env_id, idx, capture_video, run_name):
+def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
+        env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = NoopResetEnv(env, noop_max=30)
-        env = MaxAndSkipEnv(env, skip=4)
-        env = EpisodicLifeEnv(env)
-        if "FIRE" in env.unwrapped.get_action_meanings():
-            env = FireResetEnv(env)
-        env = ClipRewardEnv(env)
-        env = gym.wrappers.ResizeObservation(env, (84, 84))
-        env = gym.wrappers.GrayScaleObservation(env)
-        env = gym.wrappers.FrameStack(env, 4)
-        env = AtariStateSnapshotWrapper(env)
+        env = gym.wrappers.ClipAction(env)
+        env = gym.wrappers.NormalizeObservation(env)
+        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
+        env = gym.wrappers.NormalizeReward(env, gamma=gamma)
+        env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
+        env = MuJoCoStateSnapshotWrapper(env)
         return env
 
     return thunk
@@ -284,30 +414,33 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
-        self.network = nn.Sequential(
-            layer_init(nn.Conv2d(4, 32, 8, stride=4)),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(32, 64, 4, stride=2)),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(64, 64, 3, stride=1)),
-            nn.ReLU(),
-            nn.Flatten(),
-            layer_init(nn.Linear(64 * 7 * 7, 512)),
-            nn.ReLU(),
+        self.critic = nn.Sequential(
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 1), std=1.0),
         )
-        self.actor = layer_init(nn.Linear(512, envs.single_action_space.n), std=0.01)
-        self.critic = layer_init(nn.Linear(512, 1), std=1)
+        self.actor_mean = nn.Sequential(
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, np.prod(envs.single_action_space.shape)), std=0.01),
+        )
+        self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
 
     def get_value(self, x):
-        return self.critic(self.network(x / 255.0))
+        return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
-        hidden = self.network(x / 255.0)
-        logits = self.actor(hidden)
-        probs = Categorical(logits=logits)
+        action_mean = self.actor_mean(x)
+        action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_std = torch.exp(action_logstd)
+        probs = Normal(action_mean, action_std)
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
 
 
 def compute_tree_gae(
@@ -375,7 +508,7 @@ def compute_branch_weight(
     """
     Compute branch weight factors for specified environments.
     W_t = W_parent * state_branches[parent]
-
+    
     For root nodes (parent < 0), the initial weight is the number of branches
     originating from the same root state (from root_branch_counts).
 
@@ -392,17 +525,17 @@ def compute_branch_weight(
     device = parent_indices.device
     n_envs = len(env_indices)
     env_t = torch.tensor(env_indices, device=device, dtype=torch.long)
-
+    
     weights = torch.ones((num_steps, n_envs), device=device, dtype=torch.float32)
     for step in range(num_steps):
         p_steps = parent_indices[step, env_t]
         is_root = p_steps < 0
-
+        
         for i in is_root.nonzero(as_tuple=True)[0].tolist():
             env_idx = env_indices[i]
             tree_root_id = p_steps[i].item()
             weights[step, i] = root_branch_counts[env_idx].get(tree_root_id, 1)
-
+        
         if not is_root.all():
             valid_parents = p_steps[~is_root]
             valid_env_t = env_t[~is_root]
@@ -424,18 +557,39 @@ def select_next_states(
     skip_search: bool,
     search_count: list[dict],
     max_search: int,
-    max_exploitations: list[dict],
     c: float = 1.0,
+    tree_max_returns: list[dict] = None,
+    return_threshold: float = None,
     gamma: float = 0.99,
 ) -> list[int]:
     """
-    OPTS-TTPO node selection (aligned with verify_scaling_variance / select_next_states_v2).
+    Select which tree to search and which node to branch from.
+    Global cross-tree search: same tree's nodes may be non-contiguous in tensor.
 
-    No return-threshold gating. TUCT uses raw discounted cumulative advantage along the path
-    (not divided by remaining length); mean_exploitation = exploitation / (n - k) is used to
-    filter trees whose chosen node is not above the pooled mean of recorded max mean exploitations.
+    For each terminated env:
+    1. If skip_search: start new tree
+    2. For each non-exhausted tree, compute TUCT along optimal path with soft depth penalty
+    3. Find tree with min TUCT at its min_path_idx across all trees
+    4. If min TUCT > 0: no promising branching point → start new tree
+    5. If min TUCT <= 0: branch from that node
 
-    TUCT = exploitation - c * exploration, with exploration = (sibling_count - 1) * max_abs_exploitation.
+    TUCT = exploitation + c * exploration
+      - exploitation: backward cumulative mean of centered advantages
+      - exploration: (sibling_count - 1) * max_abs_exploitation
+
+    Args:
+        terminated_envs: The terminated environment indices
+        current_step: Current step index (the terminal step of current episode)
+        advantages, parent_indices, tree_indices: Tree data tensors
+        skip_search: Whether to skip search (e.g. last step)
+        search_count: Per-env dict mapping tree_id -> search count
+        max_search: Maximum searches per tree
+        c: Exploration coefficient for TUCT
+        tree_max_returns: Per-env dict mapping tree_id -> max episodic return
+        return_threshold: Windowed mean return threshold for gating
+
+    Returns:
+        list[int]: Selected indices (>= 0 to continue searching, < 0 for new tree)
     """
     selected = []
     n_steps = current_step + 1
@@ -444,10 +598,11 @@ def select_next_states(
         env_tree_ids = torch.unique(tree_indices[:n_steps, env_idx]).tolist()
         num_env_trees = len(env_tree_ids)
 
-        if skip_search:
+        if skip_search or return_threshold is None:
             selected.append(-(num_env_trees + 1))
             continue
 
+        # For each tree, compute TUCT and find the best branching point
         best_tuct_val = float('-inf')
         best_step_overall = None
         best_tree_id = None
@@ -459,17 +614,25 @@ def select_next_states(
             if current_count >= max_search:
                 continue
 
+            # Skip trees whose max return is above threshold
+            tree_best = tree_max_returns[env_idx].get(tid, float('-inf'))
+            if tree_best > return_threshold:
+                continue
+
+            # Get tree slice (non-contiguous nodes via tree_indices)
             tree_mask = tree_indices[:n_steps, env_idx] == tid
             tree_node_steps = tree_mask.nonzero(as_tuple=True)[0]
             tree_advs = advantages[tree_node_steps, env_idx].clone()
             tree_parents = parent_indices[tree_node_steps, env_idx]
 
+            # Find root nodes and start from root with max advantage
             root_local_mask = tree_parents < 0
             root_steps = tree_node_steps[root_local_mask]
             root_advs = advantages[root_steps, env_idx]
             best_root_local = root_advs.argmax().item()
             current_node = root_steps[best_root_local].item()
 
+            # Trace optimal path: greedily choose child with max advantage
             path = [current_node]
             while True:
                 children_of_node = (parent_indices[:n_steps, env_idx] == current_node) & tree_mask
@@ -481,20 +644,22 @@ def select_next_states(
                 current_node = children_steps[best_child].item()
                 path.append(current_node)
 
+            # Extract path data
             path_t = torch.tensor(path, device=advantages.device)
             path_local_mask = torch.isin(tree_node_steps, path_t)
             path_advs = tree_advs[path_local_mask]
             path_steps = tree_node_steps[path_local_mask]
 
+            # Expected improvement: -sum(γ^(t-k) * A_t) / remaining
+            # V^π(s_k) - G_k = -sum γ^(t-k) A_t, positive means improvement expected
             n = len(path_advs)
             exploitation = torch.zeros_like(path_advs)
-            mean_exploitation = torch.zeros_like(path_advs)
             discounted_sum = 0.0
             for k in range(n - 1, -1, -1):
                 discounted_sum = -path_advs[k].item() + gamma * discounted_sum
-                exploitation[k] = discounted_sum
-                mean_exploitation[k] = exploitation[k] / (n - k)
+                exploitation[k] = discounted_sum / (n - k)
 
+            # Compute sibling counts for exploration term
             path_parents_vals = tree_parents[path_local_mask]
             sibling_counts = torch.zeros(len(path_steps), device=advantages.device)
             for i in range(len(path_steps)):
@@ -505,17 +670,10 @@ def select_next_states(
                 max_abs_exploitation = 1.0
 
             exploration = (sibling_counts - 1) * max_abs_exploitation
+
             tuct = exploitation - c * exploration
 
             max_path_idx = tuct.argmax().item()
-            if tid not in max_exploitations[env_idx]:
-                max_exploitations[env_idx][tid] = mean_exploitation[max_path_idx].item()
-
-            max_exploitation_values = [v for d in max_exploitations for v in d.values() if v > 0]
-            mean_max_exploitations = float(np.mean(max_exploitation_values)) if len(max_exploitation_values) > 0 else 0.0
-            if mean_exploitation[max_path_idx] <= mean_max_exploitations:
-                continue
-
             max_tuct_val = tuct[max_path_idx].item()
 
             if max_tuct_val > best_tuct_val:
@@ -525,17 +683,16 @@ def select_next_states(
                 best_depth = max_path_idx
                 best_path_len = len(path)
 
+        # Decision: if best TUCT > 0 or no searchable tree, start new tree
         if best_step_overall is None:
             print(f"    New Tree: best_tuct={best_tuct_val:.4f}")
             selected.append(-(num_env_trees + 1))
         else:
             search_count[env_idx][best_tree_id] = search_count[env_idx].get(best_tree_id, 0) + 1
-            print(
-                f"    Tree Search: env_idx={env_idx}, tree_id={best_tree_id}, "
-                f"tuct={best_tuct_val:.4f}, "
-                f"search_count={search_count[env_idx][best_tree_id]}, "
-                f"depth={best_depth} / {best_path_len}"
-            )
+            print(f"    Tree Search: env_idx={env_idx}, tree_id={best_tree_id}, "
+                  f"tuct={best_tuct_val:.4f}, "
+                  f"search_count={search_count[env_idx][best_tree_id]}, "
+                  f"depth={best_depth} / {best_path_len}")
             selected.append(best_step_overall)
 
     return selected
@@ -575,12 +732,12 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup - use independent environment list for state snapshot support
-    envs = [make_env(args.env_id, i, args.capture_video, run_name)() for i in range(args.num_envs)]
-    assert isinstance(envs[0].action_space, gym.spaces.Discrete), "only discrete action space is supported"
+    envs = [make_env(args.env_id, i, args.capture_video, run_name, args.gamma)() for i in range(args.num_envs)]
+    assert isinstance(envs[0].action_space, gym.spaces.Box), "only continuous action space is supported"
 
     # SyncVectorEnv for Agent init (cleanrl convention), envs list for actual training
     envs_vec = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)]
+        [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
     )
     agent = Agent(envs_vec).to(device)
     envs_vec.close()
@@ -619,6 +776,8 @@ if __name__ == "__main__":
         next_obs[env_idx] = torch.Tensor(obs_data).to(device)
         root_states[env_idx] = [env.clone_state()]
 
+    prev_mean_return = None
+
     for iteration in range(1, args.num_iterations + 1):
         # Initialize episodic_returns for this iteration
         episodic_returns = []
@@ -633,8 +792,8 @@ if __name__ == "__main__":
         # search count per tree (inherit from previous iteration for continuing envs)
         search_count = [{} for _ in range(args.num_envs)]
 
-        # pooled mean-exploitation stats for tree filtering (verify_scaling_variance v2)
-        max_exploitations = [{} for _ in range(args.num_envs)]
+        # max episodic return per tree
+        tree_max_returns = [{} for _ in range(args.num_envs)]
 
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
@@ -655,7 +814,7 @@ if __name__ == "__main__":
         advantages.zero_()
         parent_indices.fill_(-1)
         tree_indices.zero_()
-
+        
         for step in range(0, args.num_steps):
             global_step += args.num_envs
 
@@ -680,7 +839,7 @@ if __name__ == "__main__":
                 p = current_parent[env_idx]
                 parent_indices[step, env_idx] = p
                 tree_indices[step, env_idx] = p if p < 0 else tree_indices[p, env_idx]
-
+                
                 # Update root_branch_counts if this is a root node
                 if p < 0:
                     root_id = p
@@ -711,6 +870,11 @@ if __name__ == "__main__":
 
                     if episodic_return > max_episodic_return[env_idx]:
                         max_episodic_return[env_idx] = episodic_return
+
+                    # Update per-tree max return
+                    tid = tree_indices[step, env_idx].item()
+                    if episodic_return > tree_max_returns[env_idx].get(tid, float('-inf')):
+                        tree_max_returns[env_idx][tid] = episodic_return
 
             # Convert to tensors
             next_obs = torch.stack([torch.Tensor(o) for o in next_obs_list]).to(device)
@@ -750,8 +914,9 @@ if __name__ == "__main__":
                     skip_search=skip_search,
                     search_count=search_count,
                     max_search=args.max_search_per_tree,
-                    max_exploitations=max_exploitations,
                     c=args.c,
+                    tree_max_returns=tree_max_returns,
+                    return_threshold=prev_mean_return,
                     gamma=args.gamma,
                 )
 
@@ -835,6 +1000,8 @@ if __name__ == "__main__":
             min_return = 0.0
         print(f"Iteration {iteration}: mean_return={mean_return:.4f}, max_return={max_return:.4f}, min_return={min_return:.4f}")
 
+        prev_mean_return = mean_return
+
         # Save results to JSON file
         folder_name = f"./results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
         os.makedirs(folder_name, exist_ok=True)
@@ -871,7 +1038,7 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -935,6 +1102,52 @@ if __name__ == "__main__":
         print("SPS:", int(global_step / (time.time() - start_time)))
         print()
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+    if args.save_model:
+        model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
+        torch.save(agent.state_dict(), model_path)
+        print(f"model saved to {model_path}")
+
+        # Save complete checkpoint (model weights + normalization running stats)
+        checkpoint = {"model_state_dict": agent.state_dict()}
+        env0 = envs[0]
+        if env0._normalize_obs_wrapper is not None and hasattr(env0._normalize_obs_wrapper, "obs_rms"):
+            obs_rms = env0._normalize_obs_wrapper.obs_rms
+            checkpoint["obs_rms_mean"] = np.array(obs_rms.mean, copy=True)
+            checkpoint["obs_rms_var"] = np.array(obs_rms.var, copy=True)
+            checkpoint["obs_rms_count"] = float(obs_rms.count)
+        if env0._normalize_reward_wrapper is not None and hasattr(env0._normalize_reward_wrapper, "return_rms"):
+            ret_rms = env0._normalize_reward_wrapper.return_rms
+            checkpoint["ret_rms_mean"] = np.array(ret_rms.mean, copy=True)
+            checkpoint["ret_rms_var"] = np.array(ret_rms.var, copy=True)
+            checkpoint["ret_rms_count"] = float(ret_rms.count)
+        ckpt_dir = f"checkpoints/{args.env_id}"
+        os.makedirs(ckpt_dir, exist_ok=True)
+        ckpt_path = f"{ckpt_dir}/seed{args.seed}.pt"
+        torch.save(checkpoint, ckpt_path)
+        print(f"complete checkpoint saved to {ckpt_path}")
+
+        from cleanrl_utils.evals.ppo_eval import evaluate
+
+        episodic_returns = evaluate(
+            model_path,
+            make_env,
+            args.env_id,
+            eval_episodes=10,
+            run_name=f"{run_name}-eval",
+            Model=Agent,
+            device=device,
+            gamma=args.gamma,
+        )
+        for idx, episodic_return in enumerate(episodic_returns):
+            writer.add_scalar("eval/episodic_return", episodic_return, idx)
+
+        if args.upload_model:
+            from cleanrl_utils.huggingface import push_to_hub
+
+            repo_name = f"{args.env_id}-{args.exp_name}-seed{args.seed}"
+            repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
+            push_to_hub(args, episodic_returns, repo_id, "PPO", f"runs/{run_name}", f"videos/{run_name}-eval")
 
     for env in envs:
         env.close()

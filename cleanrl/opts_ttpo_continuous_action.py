@@ -557,39 +557,18 @@ def select_next_states(
     skip_search: bool,
     search_count: list[dict],
     max_search: int,
+    max_exploitations: list[dict],
     c: float = 1.0,
-    tree_max_returns: list[dict] = None,
-    return_threshold: float = None,
     gamma: float = 0.99,
 ) -> list[int]:
     """
-    Select which tree to search and which node to branch from.
-    Global cross-tree search: same tree's nodes may be non-contiguous in tensor.
+    OPTS-TTPO node selection (aligned with verify_scaling_variance / select_next_states_v2).
 
-    For each terminated env:
-    1. If skip_search: start new tree
-    2. For each non-exhausted tree, compute TUCT along optimal path with soft depth penalty
-    3. Find tree with min TUCT at its min_path_idx across all trees
-    4. If min TUCT > 0: no promising branching point → start new tree
-    5. If min TUCT <= 0: branch from that node
+    No return-threshold gating. TUCT uses raw discounted cumulative advantage along the path
+    (not divided by remaining length); mean_exploitation = exploitation / (n - k) is used to
+    filter trees whose chosen node is not above the pooled mean of recorded max mean exploitations.
 
-    TUCT = exploitation + c * exploration
-      - exploitation: backward cumulative mean of centered advantages
-      - exploration: (sibling_count - 1) * max_abs_exploitation
-
-    Args:
-        terminated_envs: The terminated environment indices
-        current_step: Current step index (the terminal step of current episode)
-        advantages, parent_indices, tree_indices: Tree data tensors
-        skip_search: Whether to skip search (e.g. last step)
-        search_count: Per-env dict mapping tree_id -> search count
-        max_search: Maximum searches per tree
-        c: Exploration coefficient for TUCT
-        tree_max_returns: Per-env dict mapping tree_id -> max episodic return
-        return_threshold: Windowed mean return threshold for gating
-
-    Returns:
-        list[int]: Selected indices (>= 0 to continue searching, < 0 for new tree)
+    TUCT = exploitation - c * exploration, with exploration = (sibling_count - 1) * max_abs_exploitation.
     """
     selected = []
     n_steps = current_step + 1
@@ -598,11 +577,10 @@ def select_next_states(
         env_tree_ids = torch.unique(tree_indices[:n_steps, env_idx]).tolist()
         num_env_trees = len(env_tree_ids)
 
-        if skip_search or return_threshold is None:
+        if skip_search:
             selected.append(-(num_env_trees + 1))
             continue
 
-        # For each tree, compute TUCT and find the best branching point
         best_tuct_val = float('-inf')
         best_step_overall = None
         best_tree_id = None
@@ -614,25 +592,17 @@ def select_next_states(
             if current_count >= max_search:
                 continue
 
-            # Skip trees whose max return is above threshold
-            tree_best = tree_max_returns[env_idx].get(tid, float('-inf'))
-            if tree_best > return_threshold:
-                continue
-
-            # Get tree slice (non-contiguous nodes via tree_indices)
             tree_mask = tree_indices[:n_steps, env_idx] == tid
             tree_node_steps = tree_mask.nonzero(as_tuple=True)[0]
             tree_advs = advantages[tree_node_steps, env_idx].clone()
             tree_parents = parent_indices[tree_node_steps, env_idx]
 
-            # Find root nodes and start from root with max advantage
             root_local_mask = tree_parents < 0
             root_steps = tree_node_steps[root_local_mask]
             root_advs = advantages[root_steps, env_idx]
             best_root_local = root_advs.argmax().item()
             current_node = root_steps[best_root_local].item()
 
-            # Trace optimal path: greedily choose child with max advantage
             path = [current_node]
             while True:
                 children_of_node = (parent_indices[:n_steps, env_idx] == current_node) & tree_mask
@@ -644,22 +614,20 @@ def select_next_states(
                 current_node = children_steps[best_child].item()
                 path.append(current_node)
 
-            # Extract path data
             path_t = torch.tensor(path, device=advantages.device)
             path_local_mask = torch.isin(tree_node_steps, path_t)
             path_advs = tree_advs[path_local_mask]
             path_steps = tree_node_steps[path_local_mask]
 
-            # Expected improvement: -sum(γ^(t-k) * A_t) / remaining
-            # V^π(s_k) - G_k = -sum γ^(t-k) A_t, positive means improvement expected
             n = len(path_advs)
             exploitation = torch.zeros_like(path_advs)
+            mean_exploitation = torch.zeros_like(path_advs)
             discounted_sum = 0.0
             for k in range(n - 1, -1, -1):
                 discounted_sum = -path_advs[k].item() + gamma * discounted_sum
-                exploitation[k] = discounted_sum / (n - k)
+                exploitation[k] = discounted_sum
+                mean_exploitation[k] = exploitation[k] / (n - k)
 
-            # Compute sibling counts for exploration term
             path_parents_vals = tree_parents[path_local_mask]
             sibling_counts = torch.zeros(len(path_steps), device=advantages.device)
             for i in range(len(path_steps)):
@@ -670,10 +638,20 @@ def select_next_states(
                 max_abs_exploitation = 1.0
 
             exploration = (sibling_counts - 1) * max_abs_exploitation
-
             tuct = exploitation - c * exploration
 
             max_path_idx = tuct.argmax().item()
+            if tid not in max_exploitations[env_idx]:
+                max_exploitations[env_idx][tid] = mean_exploitation[max_path_idx].item()
+
+            max_exploitation_values = [v for d in max_exploitations for v in d.values() if v > 0]
+            if len(max_exploitation_values) <= 1:
+                continue
+            mean_max_exploitations = float(np.mean(max_exploitation_values))
+            std_max_exploitations = float(np.std(max_exploitation_values))
+            if mean_exploitation[max_path_idx] <= mean_max_exploitations:
+                continue
+
             max_tuct_val = tuct[max_path_idx].item()
 
             if max_tuct_val > best_tuct_val:
@@ -683,16 +661,17 @@ def select_next_states(
                 best_depth = max_path_idx
                 best_path_len = len(path)
 
-        # Decision: if best TUCT > 0 or no searchable tree, start new tree
         if best_step_overall is None:
             print(f"    New Tree: best_tuct={best_tuct_val:.4f}")
             selected.append(-(num_env_trees + 1))
         else:
             search_count[env_idx][best_tree_id] = search_count[env_idx].get(best_tree_id, 0) + 1
-            print(f"    Tree Search: env_idx={env_idx}, tree_id={best_tree_id}, "
-                  f"tuct={best_tuct_val:.4f}, "
-                  f"search_count={search_count[env_idx][best_tree_id]}, "
-                  f"depth={best_depth} / {best_path_len}")
+            print(
+                f"    Tree Search: env_idx={env_idx}, tree_id={best_tree_id}, "
+                f"tuct={best_tuct_val:.4f}, "
+                f"search_count={search_count[env_idx][best_tree_id]}, "
+                f"depth={best_depth} / {best_path_len}"
+            )
             selected.append(best_step_overall)
 
     return selected
@@ -704,7 +683,7 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    algorithm_name = f"{args.exp_name}_{datetime.now().strftime('%Y%m%d')}"
+    algorithm_name = f"{args.exp_name}_no_norm_adv_20260401"
     if args.track:
         import wandb
 
@@ -776,8 +755,6 @@ if __name__ == "__main__":
         next_obs[env_idx] = torch.Tensor(obs_data).to(device)
         root_states[env_idx] = [env.clone_state()]
 
-    prev_mean_return = None
-
     for iteration in range(1, args.num_iterations + 1):
         # Initialize episodic_returns for this iteration
         episodic_returns = []
@@ -792,8 +769,8 @@ if __name__ == "__main__":
         # search count per tree (inherit from previous iteration for continuing envs)
         search_count = [{} for _ in range(args.num_envs)]
 
-        # max episodic return per tree
-        tree_max_returns = [{} for _ in range(args.num_envs)]
+        # pooled mean-exploitation stats for tree filtering (verify_scaling_variance v2)
+        max_exploitations = [{} for _ in range(args.num_envs)]
 
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
@@ -871,11 +848,6 @@ if __name__ == "__main__":
                     if episodic_return > max_episodic_return[env_idx]:
                         max_episodic_return[env_idx] = episodic_return
 
-                    # Update per-tree max return
-                    tid = tree_indices[step, env_idx].item()
-                    if episodic_return > tree_max_returns[env_idx].get(tid, float('-inf')):
-                        tree_max_returns[env_idx][tid] = episodic_return
-
             # Convert to tensors
             next_obs = torch.stack([torch.Tensor(o) for o in next_obs_list]).to(device)
             rewards[step] = torch.tensor(rewards_list).to(device)
@@ -914,9 +886,8 @@ if __name__ == "__main__":
                     skip_search=skip_search,
                     search_count=search_count,
                     max_search=args.max_search_per_tree,
+                    max_exploitations=max_exploitations,
                     c=args.c,
-                    tree_max_returns=tree_max_returns,
-                    return_threshold=prev_mean_return,
                     gamma=args.gamma,
                 )
 
@@ -1000,8 +971,6 @@ if __name__ == "__main__":
             min_return = 0.0
         print(f"Iteration {iteration}: mean_return={mean_return:.4f}, max_return={max_return:.4f}, min_return={min_return:.4f}")
 
-        prev_mean_return = mean_return
-
         # Save results to JSON file
         folder_name = f"./results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
         os.makedirs(folder_name, exist_ok=True)
@@ -1050,6 +1019,7 @@ if __name__ == "__main__":
 
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
+                    # 改为加权归一化
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
                 # Policy loss (weighted by branch factors)
