@@ -512,7 +512,9 @@ def select_next_states(
                 max_exploitations[env_idx][tid] = mean_exploitation[max_path_idx].item()
 
             max_exploitation_values = [v for d in max_exploitations for v in d.values() if v > 0]
-            mean_max_exploitations = float(np.mean(max_exploitation_values)) if len(max_exploitation_values) > 0 else 0.0
+            if len(max_exploitation_values) < 1:
+                continue
+            mean_max_exploitations = float(np.mean(max_exploitation_values))
             if mean_exploitation[max_path_idx] <= mean_max_exploitations:
                 continue
 
