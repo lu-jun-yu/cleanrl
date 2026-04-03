@@ -683,7 +683,7 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    algorithm_name = f"{args.exp_name}_no_norm_adv_20260401"
+    algorithm_name = f"{args.exp_name}_20260403"
     if args.track:
         import wandb
 
@@ -1018,15 +1018,16 @@ if __name__ == "__main__":
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
                 mb_advantages = b_advantages[mb_inds]
+                mb_weights = b_weights[mb_inds]
                 if args.norm_adv:
-                    # 改为加权归一化
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                    mb_advantages_mean = (mb_advantages / mb_weights).sum() / (1.0 / mb_weights).sum()
+                    mb_advantages_std = ((mb_advantages - mb_advantages_mean) ** 2 / mb_weights).sum() / (1.0 / mb_weights).sum()
+                    mb_advantages = (mb_advantages - mb_advantages_mean) / (mb_advantages_std + 1e-8)
 
                 # Policy loss (weighted by branch factors)
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss_per_sample = torch.max(pg_loss1, pg_loss2)
-                mb_weights = b_weights[mb_inds]
                 pg_loss = (pg_loss_per_sample / mb_weights).sum() / (1.0 / mb_weights).sum()
 
                 # Value loss (weighted by branch factors)
