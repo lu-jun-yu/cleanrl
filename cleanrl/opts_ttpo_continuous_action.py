@@ -581,7 +581,7 @@ def select_next_states(
             selected.append(-(num_env_trees + 1))
             continue
 
-        best_tuct_val = float('-inf')
+        best_mean_exp_val = float('-inf')
         best_step_overall = None
         best_tree_id = None
         best_depth = None
@@ -651,23 +651,23 @@ def select_next_states(
             if mean_exploitation[max_path_idx] <= mean_max_exploitations:
                 continue
 
-            max_tuct_val = mean_exploitation[max_path_idx].item()
+            max_mean_exp_val = mean_exploitation[max_path_idx].item()
 
-            if max_tuct_val > best_tuct_val:
-                best_tuct_val = max_tuct_val
+            if max_mean_exp_val > best_mean_exp_val:
+                best_mean_exp_val = max_mean_exp_val
                 best_step_overall = path_steps[max_path_idx].item()
                 best_tree_id = tid
                 best_depth = max_path_idx
                 best_path_len = len(path)
 
         if best_step_overall is None:
-            print(f"    New Tree: best_tuct={best_tuct_val:.4f}")
+            print(f"    New Tree: best_mean_exp={best_mean_exp_val:.4f}")
             selected.append(-(num_env_trees + 1))
         else:
             search_count[env_idx][best_tree_id] = search_count[env_idx].get(best_tree_id, 0) + 1
             print(
                 f"    Tree Search: env_idx={env_idx}, tree_id={best_tree_id}, "
-                f"tuct={best_tuct_val:.4f}, "
+                f"mean_exp={best_mean_exp_val:.4f}, "
                 f"search_count={search_count[env_idx][best_tree_id]}, "
                 f"depth={best_depth} / {best_path_len}"
             )
@@ -682,7 +682,7 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    algorithm_name = f"{args.exp_name}_s8_20260404"
+    algorithm_name = f"{args.exp_name}_s{args.max_search_per_tree}_20260405"
     if args.track:
         import wandb
 
@@ -1021,9 +1021,7 @@ if __name__ == "__main__":
                 mb_weights_sum = (1.0 / mb_weights).sum()
                 if args.norm_adv:
                     mb_advantages_mean = (mb_advantages / mb_weights).sum() / mb_weights_sum
-                    mb_advantages_std_N = mb_weights_sum * ((mb_advantages - mb_advantages_mean) ** 2 / mb_weights).sum()
-                    mb_advantages_std_D = mb_weights_sum ** 2 - (1.0 / (mb_weights ** 2)).sum()
-                    mb_advantages_std = mb_advantages_std_N / mb_advantages_std_D
+                    mb_advantages_std = ((mb_advantages - mb_advantages_mean) ** 2 / mb_weights).sum() / mb_weights_sum
                     mb_advantages = (mb_advantages - mb_advantages_mean) / (mb_advantages_std + 1e-8)
 
                 # Policy loss (weighted by branch factors)
