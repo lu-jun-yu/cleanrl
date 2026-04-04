@@ -651,7 +651,7 @@ def select_next_states(
             if mean_exploitation[max_path_idx] <= mean_max_exploitations:
                 continue
 
-            max_tuct_val = tuct[max_path_idx].item()
+            max_tuct_val = mean_exploitation[max_path_idx].item()
 
             if max_tuct_val > best_tuct_val:
                 best_tuct_val = max_tuct_val
@@ -682,7 +682,7 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    algorithm_name = f"{args.exp_name}_20260403"
+    algorithm_name = f"{args.exp_name}_s8_20260404"
     if args.track:
         import wandb
 
@@ -1018,16 +1018,19 @@ if __name__ == "__main__":
 
                 mb_advantages = b_advantages[mb_inds]
                 mb_weights = b_weights[mb_inds]
+                mb_weights_sum = (1.0 / mb_weights).sum()
                 if args.norm_adv:
-                    mb_advantages_mean = (mb_advantages / mb_weights).sum() / (1.0 / mb_weights).sum()
-                    mb_advantages_std = ((mb_advantages - mb_advantages_mean) ** 2 / mb_weights).sum() / (1.0 / mb_weights).sum()
+                    mb_advantages_mean = (mb_advantages / mb_weights).sum() / mb_weights_sum
+                    mb_advantages_std_N = mb_weights_sum * ((mb_advantages - mb_advantages_mean) ** 2 / mb_weights).sum()
+                    mb_advantages_std_D = mb_weights_sum ** 2 - (1.0 / (mb_weights ** 2)).sum()
+                    mb_advantages_std = mb_advantages_std_N / mb_advantages_std_D
                     mb_advantages = (mb_advantages - mb_advantages_mean) / (mb_advantages_std + 1e-8)
 
                 # Policy loss (weighted by branch factors)
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss_per_sample = torch.max(pg_loss1, pg_loss2)
-                pg_loss = (pg_loss_per_sample / mb_weights).sum() / (1.0 / mb_weights).sum()
+                pg_loss = (pg_loss_per_sample / mb_weights).sum() / mb_weights_sum
 
                 # Value loss (weighted by branch factors)
                 newvalue = newvalue.view(-1)
@@ -1040,10 +1043,10 @@ if __name__ == "__main__":
                     )
                     v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * (v_loss_max / mb_weights).sum() / (1.0 / mb_weights).sum()
+                    v_loss = 0.5 * (v_loss_max / mb_weights).sum() / mb_weights_sum
                 else:
                     v_loss_per_sample = (newvalue - b_returns[mb_inds]) ** 2
-                    v_loss = 0.5 * (v_loss_per_sample / mb_weights).sum() / (1.0 / mb_weights).sum()
+                    v_loss = 0.5 * (v_loss_per_sample / mb_weights).sum() / mb_weights_sum
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
