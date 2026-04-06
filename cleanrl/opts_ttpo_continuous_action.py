@@ -79,6 +79,8 @@ class Args:
     target_kl: float = None
     """the target KL divergence threshold"""
 
+    tau: float = 0.0
+    """tau for the TUCT node selection"""
     max_search_per_tree: int = 4
     """maximum number of tree searches per environment per iteration"""
     c: float = 1.0
@@ -560,6 +562,7 @@ def select_next_states(
     max_exploitations: list[dict],
     c: float = 1.0,
     gamma: float = 0.99,
+    tau: float = 0.0,
 ) -> list[int]:
     """
     OPTS-TTPO node selection (aligned with verify_scaling_variance / select_next_states_v2).
@@ -625,7 +628,7 @@ def select_next_states(
             discounted_sum = 0.0
             for k in range(n - 1, -1, -1):
                 discounted_sum = -path_advs[k].item() + gamma * discounted_sum
-                exploitation[k] = discounted_sum
+                exploitation[k] = discounted_sum / ((n - k) ** tau)
                 mean_exploitation[k] = exploitation[k] / (n - k)
 
             path_parents_vals = tree_parents[path_local_mask]
@@ -682,7 +685,7 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    algorithm_name = f"{args.exp_name}_s{args.max_search_per_tree}_20260405"
+    algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260406"
     if args.track:
         import wandb
 
@@ -888,6 +891,7 @@ if __name__ == "__main__":
                     max_exploitations=max_exploitations,
                     c=args.c,
                     gamma=args.gamma,
+                    tau=args.tau,
                 )
 
                 # TUCT selection and state restoration
