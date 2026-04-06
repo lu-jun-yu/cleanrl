@@ -888,7 +888,8 @@ if __name__ == "__main__":
                 mb_weights_sum = (1.0 / mb_weights).sum()
                 if args.norm_adv:
                     mb_advantages_mean = (mb_advantages / mb_weights).sum() / mb_weights_sum
-                    mb_advantages_std = ((mb_advantages - mb_advantages_mean) ** 2 / mb_weights).sum() / mb_weights_sum
+                    mb_advantages_var = ((mb_advantages - mb_advantages_mean) ** 2 / mb_weights).sum() / mb_weights_sum
+                    mb_advantages_std = torch.sqrt(mb_advantages_var)
                     mb_advantages = (mb_advantages - mb_advantages_mean) / (mb_advantages_std + 1e-8)
 
                 # Policy loss (weighted by branch factors)
