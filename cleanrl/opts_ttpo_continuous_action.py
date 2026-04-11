@@ -560,6 +560,7 @@ def select_next_states(
     search_count: list[dict],
     max_search: int,
     max_exploitations: list[dict],
+    skip_init_search: list[bool],
     c: float = 1.0,
     gamma: float = 0.99,
     tau: float = 0.0,
@@ -569,7 +570,7 @@ def select_next_states(
 
     No return-threshold gating. TUCT uses raw discounted cumulative advantage along the path
     (not divided by remaining length); mean_exploitation = exploitation / (n - k) is used to
-    filter trees whose chosen node is not above the pooled mean of recorded max mean exploitations.
+    filter trees whose chosen node is not above the pooled mean of recorded max_exploitations values.
 
     TUCT = exploitation - c * exploration, with exploration = (sibling_count - 1) * max_abs_exploitation.
     """
@@ -591,6 +592,8 @@ def select_next_states(
         best_path_len = None
 
         for tid in env_tree_ids:
+            if skip_init_search[env_idx] and tid == -1:
+                continue
             current_count = search_count[env_idx].get(tid, 0)
             if current_count >= max_search:
                 continue
@@ -624,12 +627,10 @@ def select_next_states(
 
             n = len(path_advs)
             exploitation = torch.zeros_like(path_advs)
-            mean_exploitation = torch.zeros_like(path_advs)
             discounted_sum = 0.0
             for k in range(n - 1, -1, -1):
                 discounted_sum = -path_advs[k].item() + gamma * discounted_sum
                 exploitation[k] = discounted_sum / ((n - k) ** tau)
-                mean_exploitation[k] = exploitation[k] / (n - k)
 
             path_parents_vals = tree_parents[path_local_mask]
             sibling_counts = torch.zeros(len(path_steps), device=advantages.device)
@@ -644,17 +645,16 @@ def select_next_states(
             tuct = exploitation - c * exploration
 
             max_path_idx = tuct.argmax().item()
+            max_mean_exp_val = exploitation[max_path_idx].item()
             if tid not in max_exploitations[env_idx]:
-                max_exploitations[env_idx][tid] = mean_exploitation[max_path_idx].item()
+                max_exploitations[env_idx][tid] = max_mean_exp_val
 
             max_exploitation_values = [v for d in max_exploitations for v in d.values() if v > 0]
-            if len(max_exploitation_values) < 1:
+            if len(max_exploitation_values) <= 1:
                 continue
             mean_max_exploitations = float(np.mean(max_exploitation_values))
-            if mean_exploitation[max_path_idx] <= mean_max_exploitations:
+            if max_mean_exp_val <= mean_max_exploitations:
                 continue
-
-            max_mean_exp_val = mean_exploitation[max_path_idx].item()
 
             if max_mean_exp_val > best_mean_exp_val:
                 best_mean_exp_val = max_mean_exp_val
@@ -685,7 +685,7 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260406"
+    algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260410"
     if args.track:
         import wandb
 
@@ -780,8 +780,13 @@ if __name__ == "__main__":
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
 
+        if iteration == 1:
+            skip_init_search = [False] * args.num_envs
+        else:
+            skip_init_search = [True] * args.num_envs
         for env_idx, env in enumerate(envs):
             if next_done[env_idx] == 1:
+                skip_init_search[env_idx] = False
                 obs_data, _ = env.reset()
                 next_obs[env_idx] = torch.Tensor(obs_data).to(device)
             root_states[env_idx] = [env.clone_state()]
@@ -889,6 +894,7 @@ if __name__ == "__main__":
                     search_count=search_count,
                     max_search=args.max_search_per_tree,
                     max_exploitations=max_exploitations,
+                    skip_init_search=skip_init_search,
                     c=args.c,
                     gamma=args.gamma,
                     tau=args.tau,
@@ -972,6 +978,7 @@ if __name__ == "__main__":
             mean_return = 0.0
             max_return = 0.0
             min_return = 0.0
+
         print(f"Iteration {iteration}: mean_return={mean_return:.4f}, max_return={max_return:.4f}, min_return={min_return:.4f}")
 
         # Save results to JSON file
