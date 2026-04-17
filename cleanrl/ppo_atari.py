@@ -151,7 +151,7 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    algorithm_name = f"{args.exp_name}_20260413"
+    algorithm_name = f"{args.exp_name}_20260228"
     if args.track:
         import wandb
 
@@ -245,7 +245,8 @@ if __name__ == "__main__":
 
         folder_name = f"./results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
         os.makedirs(folder_name, exist_ok=True)
-        result_filename = f"{folder_name}/{args.env_id}_{args.seed}.json"
+        safe_env_id = args.env_id.replace("/", "_")
+        result_filename = f"{folder_name}/{safe_env_id}_{args.seed}.json"
         if os.path.exists(result_filename):
             with open(result_filename, "r") as f:
                 results_data = json.load(f)
