@@ -52,9 +52,9 @@ class Args:
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 1
+    num_envs: int = 8
     """the number of parallel game environments"""
-    num_steps: int = 4096
+    num_steps: int = 128
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
@@ -81,9 +81,9 @@ class Args:
     target_kl: float = None
     """the target KL divergence threshold"""
 
-    tau: float = 0.0
+    tau: float = 0.6
     """tau for the TUCT node selection"""
-    max_search_per_tree: int = 4
+    max_search_per_tree: int = 6
     """maximum number of tree searches per environment per iteration"""
     c: float = 1.0
     """exploration coefficient for TUCT node selection"""
@@ -552,7 +552,7 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260410"
+    algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260413"
     if args.track:
         import wandb
 
@@ -851,7 +851,8 @@ if __name__ == "__main__":
         # Save results to JSON file
         folder_name = f"./results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
         os.makedirs(folder_name, exist_ok=True)
-        result_filename = f"{folder_name}/{args.env_id}_{args.seed}.json"
+        safe_env_id = args.env_id.replace("/", "_")
+        result_filename = f"{folder_name}/{safe_env_id}_{args.seed}.json"
         if os.path.exists(result_filename):
             with open(result_filename, "r") as f:
                 results_data = json.load(f)
