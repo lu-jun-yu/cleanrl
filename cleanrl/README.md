@@ -2,14 +2,14 @@
 
 ## 1. 算法概述
 
-OPTS_TTPO（On-policy Parallel Tree Search + Tree Trajectory Policy Optimization）将树搜索与 PPO 策略梯度相结合。每个环境在 rollout 过程中维护一棵或多棵搜索树，episode 终止时通过 TUCT 选择已有树的分支点进行回溯扩展，或开启新树。所有树上的数据统一进行 TreeGAE 优势估计和 branch_weight 校正后的 PPO 更新。
+OPTS_TTPO（On-policy Parallel Tree Search + Tree Trajectory Policy Optimization）将树搜索与 PPO 策略梯度相结合。每个环境在 rollout 过程中维护一棵或多棵搜索树，episode 终止时通过 OTRC 选择已有树的分支点进行回溯扩展，或开启新树。所有树上的数据统一进行 TreeGAE 优势估计和 branch_weight 校正后的 PPO 更新。
 
 ### 与 PPO 的区别
 
 | 特性 | PPO | OPTS_TTPO |
 |------|-----|-----------|
 | 轨迹结构 | 线性 | 树形，多棵树共存 |
-| 终止处理 | reset | TUCT 选择分支点或开新树 |
+| 终止处理 | reset | OTRC 选择分支点或开新树 |
 | 优势估计 | GAE | TreeGAE，分支节点取子节点优势均值回传 |
 | 策略梯度 | 标准 | branch_weight 加权校正 |
 | 跨迭代 | 每次全部 reset | 未终止 episode 自然延续到下一迭代 |
@@ -26,7 +26,7 @@ OPTS_TTPO（On-policy Parallel Tree Search + Tree Trajectory Policy Optimization
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | max_search_per_tree | 4 | 每棵树每迭代最大搜索次数 |
-| c | 1.0 | TUCT 中 exploration 项系数 |
+| c | 1.0 | OTRC 中 exploration 项系数 |
 
 
 ## 3. 数据结构
@@ -37,7 +37,7 @@ OPTS_TTPO（On-policy Parallel Tree Search + Tree Trajectory Policy Optimization
 
 tree_indices 张量记录每个节点所属的树 ID，该值等于该树根节点在 parent_indices 中的负数值。节点的 tree_id 继承规则：若自身的 parent 为负数则 tree_id 等于该负数，否则继承父节点的 tree_id。
 
-state_branches 张量记录每个节点被分支的次数，初始为 1。当 TUCT 选择从某节点分支时，该节点的 state_branches 加 1。
+state_branches 张量记录每个节点被分支的次数，初始为 1。当 OTRC 选择从某节点分支时，该节点的 state_branches 加 1。
 
 ### 根节点管理
 
@@ -49,16 +49,16 @@ root_states 是每个环境的列表，新根通过 insert(0, ...) 插入列表�
 
 - root_branch_counts：每个环境的字典，记录各根状态被分支的次数（即从同一根出发的一级节点数），用于计算根节点的 branch_weight。
 - search_count：每个环境的字典，记录每棵树在本迭代已被搜索的次数，达到 max_search_per_tree 时不再对该树搜索。
-- tree_max_returns：每个环境的字典，记录每棵树在本迭代的最大 episodic return，用于 TUCT 中的树跳过判断。
+- tree_max_returns：每个环境的字典，记录每棵树在本迭代的最大 episodic return，用于 OTRC 中的树跳过判断。
 - episodic_return_info：全局列表，记录本迭代所有终止 episode 的 (return, tree_id, step, env_idx) 四元组，用于计算 aggregated_returns。
 
 ### 环境状态快照
 
-env_states 是二维列表（num_steps x num_envs），保存每步执行动作后的环境状态快照。用于 TUCT 选择分支点后恢复环境到该点的父状态。
+env_states 是二维列表（num_steps x num_envs），保存每步执行动作后的环境状态快照。用于 OTRC 选择分支点后恢复环境到该点的父状态。
 
 ### 树结构示例
 
-假设某环境有两棵树。树 A 最先创建，根状态存于 root_states[-1]，tree_id=-1。树 A 有一条从根出发的主路径 step 0→1→2（step 2 终止），之后 TUCT 选择从根分支，产生 step 3→4。树 B 后创建，根状态存于 root_states[-2]，tree_id=-2，有路径 step 5→6。
+假设某环境有两棵树。树 A 最先创建，根状态存于 root_states[-1]，tree_id=-1。树 A 有一条从根出发的主路径 step 0→1→2（step 2 终止），之后 OTRC 选择从根分支，产生 step 3→4。树 B 后创建，根状态存于 root_states[-2]，tree_id=-2，有路径 step 5→6。
 
 此时 parent_indices 为 [-1, 0, 1, -1, 3, -2, 5]，tree_indices 为 [-1, -1, -1, -1, -1, -2, -2]。root_branch_counts 中 -1 的值为 2（根 A 出发了两条分支），-2 的值为 1。
 
@@ -84,12 +84,12 @@ env_states 是二维列表（num_steps x num_envs），保存每步执行动作�
 **处理终止环境。** 分三阶段处理所有终止的环境：
 
 1. **TreeGAE 阶段**：对每个终止环境分别调用 TreeGAE，从终止节点回溯更新 advantages（next_value=0）。
-2. **TUCT 选择阶段**：将所有终止环境的索引批量传入 select_next_states，一次性为每个环境选择下一步操作。
+2. **OTRC 选择阶段**：将所有终止环境的索引批量传入 select_next_states，一次性为每个环境选择下一步操作。
 3. **状态恢复阶段**：逐个根据选择结果恢复环境状态。
 
-若 TUCT 返回负值（开新树），reset 环境，将新根插入 root_states 头部，设置 current_parent 为对应的负索引。
+若 OTRC 返回负值（开新树），reset 环境，将新根插入 root_states 头部，设置 current_parent 为对应的负索引。
 
-若 TUCT 返回非负 step 索引（分支搜索），恢复到该 step 的父状态。若父状态是根则从 root_states 恢复，否则从 env_states 恢复并将该父节点的 state_branches 加 1。将 next_obs 设为被选中 step 的观测（从同一状态重新采样新动作），current_parent 设为该父节点。
+若 OTRC 返回非负 step 索引（分支搜索），恢复到该 step 的父状态。若父状态是根则从 root_states 恢复，否则从 env_states 恢复并将该父节点的 state_branches 加 1。将 next_obs 设为被选中 step 的观测（从同一状态重新采样新动作），current_parent 设为该父节点。
 
 ### 4.3 采样结束后
 
@@ -99,7 +99,7 @@ env_states 是二维列表（num_steps x num_envs），保存每步执行动作�
 
 计算 branch_weight。
 
-按 (env_idx, tree_id) 分组，对本迭代所有终止 episode 的 return 进行 branch_weight 加权平均，得到 aggregated_returns，进而计算 mean_return。将 mean_return 直接作为下一迭代 TUCT 的 return_threshold（prev_mean_return = mean_return）。
+按 (env_idx, tree_id) 分组，对本迭代所有终止 episode 的 return 进行 branch_weight 加权平均，得到 aggregated_returns，进而计算 mean_return。将 mean_return 直接作为下一迭代 OTRC 的 return_threshold（prev_mean_return = mean_return）。
 
 执行 PPO 更新，policy loss 和 value loss 均用 branch_weight 加权。
 
@@ -116,7 +116,7 @@ TD 误差 delta = reward + gamma * V_next - V_current。叶节点的 advantage �
 
 每次 episode 终止时触发一次 TreeGAE（next_value=0），迭代结束时对未终止轨迹再触发一次（带 bootstrap value）。advantage 是 in-place 更新，分支节点的值随着更多子轨迹完成而持续修正。
 
-### 5.2 TUCT（Tree Upper Confidence for Trees）
+### 5.2 OTRC（Tree Upper Confidence for Trees）
 
 episode 终止时，为该环境跨所有树全局选择最佳分支点。
 
@@ -126,7 +126,7 @@ episode 终止时，为该环境跨所有树全局选择最佳分支点。
 
 对于剩余的树，找到其最优路径：从 advantage 最大的根节点出发，每步贪心选择 advantage 最大的子节点，直到叶节点。
 
-沿最优路径计算 TUCT 值。
+沿最优路径计算 OTRC 值。
 
 #### 5.2.1 exploitation（期望改善量）的数学推导
 
@@ -169,11 +169,11 @@ V^π(s_k) - G_k = -sum_{t=k}^{T} γ^{t-k} A^π(s_t, a_t)
 
 等于 (sibling_count - 1) * max_abs_exploitation，其中 sibling_count 是共享同一父节点的全部子节点数（包含节点自身），因此 (sibling_count - 1) 表示该父节点已被分支探索的额外次数。max_abs_exploitation 是整条路径上 exploitation 绝对值的最大值（若为 0 则设为 1.0），用于将 exploration 项标准化到与 exploitation 同一量级。
 
-#### 5.2.3 TUCT 与选择
+#### 5.2.3 OTRC 与选择
 
-**TUCT = exploitation - c * exploration**。取路径上 TUCT 最大的节点（期望改善最大且未被过度搜索）作为候选分支点。
+**OTRC = exploitation - c * exploration**。取路径上 OTRC 最大的节点（期望改善最大且未被过度搜索）作为候选分支点。
 
-遍历所有树后，选择全局 TUCT 最大的分支点。只要存在任何可搜索的树（未被跳过且搜索次数未满），就一定选择分支，不检查 TUCT 值正负。仅当所有树都被跳过（搜索次数已满或 max return 超过阈值）时才开新树。
+遍历所有树后，选择全局 OTRC 最大的分支点。只要存在任何可搜索的树（未被跳过且搜索次数未满），就一定选择分支，不检查 OTRC 值正负。仅当所有树都被跳过（搜索次数已满或 max return 超过阈值）时才开新树。
 
 ### 5.3 Branch Weight Factor
 
@@ -187,7 +187,7 @@ branch_weight 校正树形结构下的策略梯度，使其保持无偏。
 
 每迭代结束时，按 (env_idx, tree_id) 对本迭代终止的 episode 分组。同组内各 episode 的 return 用 branch_weight 倒数加权平均，得到每组的 aggregated_return。对所有组求均值得到 mean_return。
 
-mean_return 直接赋值给 prev_mean_return，作为下一迭代 TUCT 中的树跳过阈值（return_threshold）。首次迭代时 prev_mean_return 为 None，此时所有终止 episode 直接开新树，不进行树搜索。
+mean_return 直接赋值给 prev_mean_return，作为下一迭代 OTRC 中的树跳过阈值（return_threshold）。首次迭代时 prev_mean_return 为 None，此时所有终止 episode 直接开新树，不进行树搜索。
 
 ### 5.5 策略梯度（TTPO）
 
@@ -271,7 +271,7 @@ MuJoCo 环境 wrapper 链（从内到外）：`gym.make` → `FlattenObservation
 
 ### 6.3 两个实现变体的差异
 
-核心算法（TreeGAE、TUCT、branch_weight、aggregated_returns、加权 PPO 更新）在 Atari 和 MuJoCo 两个实现中完全一致，差异仅在于环境接口适配层：
+核心算法（TreeGAE、OTRC、branch_weight、aggregated_returns、加权 PPO 更新）在 Atari 和 MuJoCo 两个实现中完全一致，差异仅在于环境接口适配层：
 
 | 差异项 | Atari (`opts_ttpo_atari.py`) | MuJoCo (`opts_ttpo_continuous_action.py`) |
 |--------|------------------------------|-------------------------------------------|

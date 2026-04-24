@@ -82,11 +82,11 @@ class Args:
     """the target KL divergence threshold"""
 
     tau: float = 0.6
-    """tau for the TUCT node selection"""
+    """tau for the OTRC node selection"""
     max_search_per_tree: int = 6
     """maximum number of tree searches per environment per iteration"""
     c: float = 1.0
-    """exploration coefficient for TUCT node selection"""
+    """exploration coefficient for OTRC node selection"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -435,11 +435,11 @@ def select_next_states(
     """
     OPTS-TTPO node selection (aligned with verify_scaling_variance / select_next_states_v2).
 
-    No return-threshold gating. TUCT uses raw discounted cumulative advantage along the path
+    No return-threshold gating. OTRC uses raw discounted cumulative advantage along the path
     (not divided by remaining length); mean_exploitation = exploitation / (n - k) is used to
     filter trees whose chosen node is not above the pooled mean of recorded max_exploitations values.
 
-    TUCT = exploitation - c * exploration, with exploration = (sibling_count - 1) * max_abs_exploitation.
+    OTRC = exploitation - c * exploration, with exploration = (sibling_count - 1) * max_abs_exploitation.
     """
     selected = []
     n_steps = current_step + 1
@@ -509,9 +509,9 @@ def select_next_states(
                 max_abs_exploitation = 1.0
 
             exploration = (sibling_counts - 1) * max_abs_exploitation
-            tuct = exploitation - c * exploration
+            otrc_score = exploitation - c * exploration
 
-            max_path_idx = tuct.argmax().item()
+            max_path_idx = otrc_score.argmax().item()
             max_mean_exp_val = exploitation[max_path_idx].item()
             if tid not in max_exploitations[env_idx]:
                 max_exploitations[env_idx][tid] = max_mean_exp_val
@@ -767,7 +767,7 @@ if __name__ == "__main__":
                     tau=args.tau,
                 )
 
-                # TUCT selection and state restoration
+                # OTRC selection and state restoration
                 for i, env_idx in enumerate(terminated_envs):
                     if selected[i] < 0:
                         # Variance is stable, start a new tree
