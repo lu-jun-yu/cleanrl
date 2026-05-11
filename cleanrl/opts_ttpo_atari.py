@@ -81,7 +81,7 @@ class Args:
     target_kl: float = None
     """the target KL divergence threshold"""
 
-    tau: float = 0.6
+    tau: float = 0.7
     """tau for the OTRC node selection"""
     max_search_per_tree: int = 6
     """maximum number of tree searches per environment per iteration"""
@@ -430,7 +430,7 @@ def select_next_states(
     skip_init_search: list[bool],
     c: float = 1.0,
     gamma: float = 0.99,
-    tau: float = 0.0,
+    tau: float = 0.7,
 ) -> list[int]:
     """
     OPTS-TTPO node selection (aligned with verify_scaling_variance / select_next_states_v2).
