@@ -1039,12 +1039,13 @@ if __name__ == "__main__":
 
                 mb_advantages = b_advantages[mb_inds]
                 mb_weights = b_weights[mb_inds]
-                mb_weights_sum = (1.0 / mb_weights).sum()
-                mb_weights2_sum = ((1.0 / mb_weights) ** 2).sum()
-                inv_mb_weights_divisor = mb_weights_sum / (mb_weights_sum ** 2 - mb_weights2_sum)
+                w = 1.0 / mb_weights
+                w_sum = w.sum()
+                w_sq_sum = (w ** 2).sum()
+                unbiased_var_factor = w_sum / (w_sum ** 2 - w_sq_sum)
                 if args.norm_adv:
-                    mb_advantages_mean = (mb_advantages / mb_weights).sum() / mb_weights_sum
-                    mb_advantages_var = ((mb_advantages - mb_advantages_mean) ** 2 / mb_weights).sum() * inv_mb_weights_divisor
+                    mb_advantages_mean = (mb_advantages * w).sum() / w_sum
+                    mb_advantages_var = ((mb_advantages - mb_advantages_mean) ** 2 * w).sum() * unbiased_var_factor
                     mb_advantages_std = torch.sqrt(mb_advantages_var)
                     mb_advantages = (mb_advantages - mb_advantages_mean) / (mb_advantages_std + 1e-8)
 
@@ -1052,7 +1053,7 @@ if __name__ == "__main__":
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss_per_sample = torch.max(pg_loss1, pg_loss2)
-                pg_loss = (pg_loss_per_sample / mb_weights).sum() / mb_weights_sum
+                pg_loss = (pg_loss_per_sample * w).sum() / w_sum
 
                 # Value loss (weighted by branch factors)
                 newvalue = newvalue.view(-1)
@@ -1065,10 +1066,10 @@ if __name__ == "__main__":
                     )
                     v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * (v_loss_max / mb_weights).sum() / mb_weights_sum
+                    v_loss = 0.5 * (v_loss_max * w).sum() / w_sum
                 else:
                     v_loss_per_sample = (newvalue - b_returns[mb_inds]) ** 2
-                    v_loss = 0.5 * (v_loss_per_sample / mb_weights).sum() / mb_weights_sum
+                    v_loss = 0.5 * (v_loss_per_sample * w).sum() / w_sum
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
