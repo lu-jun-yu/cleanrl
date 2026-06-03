@@ -552,11 +552,9 @@ def compute_branch_weight(
 def select_next_states(
     terminated_envs: list[int],
     current_step: int,
-    num_steps: int,
     advantages: torch.Tensor,
     parent_indices: torch.Tensor,
     tree_indices: torch.Tensor,
-    skip_search: bool,
     search_count: list[dict],
     max_search: int,
     max_exploitations: list[dict],
@@ -566,115 +564,125 @@ def select_next_states(
     tau: float = 0.7,
 ) -> list[int]:
     """
-    OPTS-TTPO node selection (aligned with verify_scaling_variance / select_next_states_v2).
-
-    No return-threshold gating. OTRC uses raw discounted cumulative advantage along the path
-    (not divided by remaining length); mean_exploitation = exploitation / (n - k) is used to
-    filter trees whose chosen node is not above the pooled mean of recorded max_exploitations values.
-
-    OTRC = exploitation - c * exploration, with exploration = (sibling_count - 1) * max_abs_exploitation.
+    OPTS-TTPO node selection, vectorized over all terminated envs' trees at once (flat id = step*E + e_local).
+    Trees are registered first, then gated in one order-independent pass; selection stays per-env.
     """
     selected = []
     n_steps = current_step + 1
+    device = advantages.device
+    dtype = advantages.dtype
+    neg_inf = torch.tensor(float("-inf"), device=device, dtype=dtype)
 
-    for env_idx in terminated_envs:
-        env_tree_ids = torch.unique(tree_indices[:n_steps, env_idx]).tolist()
-        num_env_trees = len(env_tree_ids)
+    E = len(terminated_envs)
+    env_arr = torch.tensor(terminated_envs, device=device, dtype=torch.long)
+    sub_par = parent_indices[:n_steps, env_arr]
+    sub_advs = advantages[:n_steps, env_arr]
+    sub_trees = tree_indices[:n_steps, env_arr]
+    N = n_steps * E
 
-        if skip_search:
-            selected.append(-(num_env_trees + 1))
+    # flat id = step*E + e_local; a child and its parent share e_local, so envs never mix.
+    step_grid = torch.arange(n_steps, device=device).unsqueeze(1).expand(n_steps, E)
+    e_grid = torch.arange(E, device=device).unsqueeze(0).expand(n_steps, E)
+
+    is_child = sub_par >= 0
+    child_nodes = (step_grid * E + e_grid)[is_child]
+    parent_of_child = (sub_par * E + e_grid)[is_child]
+    child_adv = sub_advs[is_child]
+    group_max = torch.full((N,), float("-inf"), device=device, dtype=dtype)
+    group_max.scatter_reduce_(0, parent_of_child, child_adv, reduce="amax", include_self=True)
+    qual = child_adv == group_max[parent_of_child]
+    best_child = torch.full((N,), -1, device=device, dtype=torch.long)
+    best_child.scatter_reduce_(0, parent_of_child[qual], child_nodes[qual], reduce="amin", include_self=False)
+
+    _, inv, counts = torch.unique((sub_par * E + e_grid).reshape(-1), return_inverse=True, return_counts=True)
+    sibling_count = counts[inv].to(dtype)
+
+    active_tids, roots, tree_e_local = [], [], []
+    env_num_trees = [0] * E
+    for e_local, env_idx in enumerate(terminated_envs):
+        col_trees = sub_trees[:, e_local]
+        col_parents = sub_par[:, e_local]
+        col_advs = sub_advs[:, e_local]
+        env_tree_ids = torch.unique(col_trees).tolist()
+        env_num_trees[e_local] = len(env_tree_ids)
+        for tid in env_tree_ids:
+            if (skip_init_search[env_idx] and tid == -1) or search_count[env_idx].get(tid, 0) >= max_search:
+                continue
+            root_steps = ((col_trees == tid) & (col_parents < 0)).nonzero(as_tuple=True)[0]
+            active_tids.append(tid)
+            roots.append(root_steps[col_advs[root_steps].argmax()].item() * E + e_local)
+            tree_e_local.append(e_local)
+
+    T = len(active_tids)
+    eligible = torch.zeros(T, device=device, dtype=torch.bool)
+    e_local_arr = torch.tensor(tree_e_local, device=device, dtype=torch.long)
+    if T:
+        cur = torch.tensor(roots, device=device, dtype=torch.long)
+
+        active = torch.ones(T, device=device, dtype=torch.bool)
+        path_cols, mask_cols = [], []
+        while bool(active.any()):
+            path_cols.append(cur)
+            mask_cols.append(active.clone())
+
+            child = best_child[cur]
+            active = active & (child >= 0)
+            cur = torch.where(active, child, cur)
+
+        path_idx = torch.stack(path_cols, dim=1)
+        path_mask = torch.stack(mask_cols, dim=1)
+        row = torch.arange(T, device=device)
+        path_idx = torch.cat([path_idx, cur[:, None]], dim=1)
+        path_mask = torch.cat([path_mask, torch.zeros((T, 1), device=device, dtype=torch.bool)], dim=1)
+        virtual_pos = (~path_mask).int().argmax(dim=1)
+        path_mask[row, virtual_pos] = True
+        n_t = path_mask.sum(dim=1)
+
+        path_adv = sub_advs.reshape(-1)[path_idx].masked_fill(~path_mask, 0.0)
+        path_adv[row, virtual_pos] = 0.0
+        exploitation = torch.zeros_like(path_adv)
+        discounted = torch.zeros(T, device=device, dtype=dtype)
+        for k in range(path_idx.shape[1] - 1, -1, -1):
+            m = path_mask[:, k].to(dtype)
+            discounted = (-path_adv[:, k] + gamma * discounted) * m + discounted * (1 - m)
+            divisor = torch.where(path_mask[:, k], n_t - k, 1).to(dtype) ** tau
+            exploitation[:, k] = torch.where(path_mask[:, k], discounted / divisor, torch.zeros_like(discounted))
+
+        max_abs = exploitation.abs().amax(dim=1)
+        max_abs = torch.where(max_abs == 0, torch.ones_like(max_abs), max_abs)
+        path_sibling = sibling_count[path_idx]
+        path_sibling[row, virtual_pos] = 1
+        exploration = (path_sibling - 1) * max_abs.unsqueeze(1)
+        otrc = exploitation - c * exploration
+
+        max_pos = torch.where(path_mask, otrc, neg_inf).argmax(dim=1)
+        max_exp_val = exploitation[row, max_pos]
+        best_step = path_idx[row, max_pos] // E
+
+        for i, tid in enumerate(active_tids):
+            max_exploitations[terminated_envs[tree_e_local[i]]].setdefault(tid, float(max_exp_val[i].item()))
+
+        pool = [v for d in max_exploitations for v in d.values()]
+        if len(pool) > 1:
+            eligible = max_exp_val > float(np.mean(pool))
+
+    for e_local, env_idx in enumerate(terminated_envs):
+        mask = (e_local_arr == e_local) & eligible
+        if not bool(mask.any()):
+            print(f"    New Tree: best_mean_exp={float('-inf'):.4f}")
+            selected.append(-(env_num_trees[e_local] + 1))
             continue
 
-        best_mean_exp_val = float('-inf')
-        best_step_overall = None
-        best_tree_id = None
-        best_depth = None
-        best_path_len = None
-
-        for tid in env_tree_ids:
-            if skip_init_search[env_idx] and tid == -1:
-                continue
-            current_count = search_count[env_idx].get(tid, 0)
-            if current_count >= max_search:
-                continue
-
-            tree_mask = tree_indices[:n_steps, env_idx] == tid
-            tree_node_steps = tree_mask.nonzero(as_tuple=True)[0]
-            tree_advs = advantages[tree_node_steps, env_idx].clone()
-            tree_parents = parent_indices[tree_node_steps, env_idx]
-
-            root_local_mask = tree_parents < 0
-            root_steps = tree_node_steps[root_local_mask]
-            root_advs = advantages[root_steps, env_idx]
-            best_root_local = root_advs.argmax().item()
-            current_node = root_steps[best_root_local].item()
-
-            path = [current_node]
-            while True:
-                children_of_node = (parent_indices[:n_steps, env_idx] == current_node) & tree_mask
-                children_steps = children_of_node.nonzero(as_tuple=True)[0]
-                if len(children_steps) == 0:
-                    break
-                child_advs = advantages[children_steps, env_idx]
-                best_child = child_advs.argmax().item()
-                current_node = children_steps[best_child].item()
-                path.append(current_node)
-
-            path_t = torch.tensor(path, device=advantages.device)
-            path_local_mask = torch.isin(tree_node_steps, path_t)
-            path_advs = tree_advs[path_local_mask]
-            path_steps = tree_node_steps[path_local_mask]
-
-            n = len(path_advs)
-            exploitation = torch.zeros_like(path_advs)
-            discounted_sum = 0.0
-            for k in range(n - 1, -1, -1):
-                discounted_sum = -path_advs[k].item() + gamma * discounted_sum
-                exploitation[k] = discounted_sum / ((n - k) ** tau)
-
-            path_parents_vals = tree_parents[path_local_mask]
-            sibling_counts = torch.zeros(len(path_steps), device=advantages.device)
-            for i in range(len(path_steps)):
-                sibling_counts[i] = (tree_parents == path_parents_vals[i]).sum()
-
-            max_abs_exploitation = exploitation.abs().max().item()
-            if max_abs_exploitation == 0:
-                max_abs_exploitation = 1.0
-
-            exploration = (sibling_counts - 1) * max_abs_exploitation
-            otrc_score = exploitation - c * exploration
-
-            max_path_idx = otrc_score.argmax().item()
-            max_mean_exp_val = exploitation[max_path_idx].item()
-            if tid not in max_exploitations[env_idx]:
-                max_exploitations[env_idx][tid] = max_mean_exp_val
-
-            max_exploitation_values = [v for d in max_exploitations for v in d.values() if v > 0]
-            if len(max_exploitation_values) <= 1:
-                continue
-            mean_max_exploitations = float(np.mean(max_exploitation_values))
-            if max_mean_exp_val <= mean_max_exploitations:
-                continue
-
-            if max_mean_exp_val > best_mean_exp_val:
-                best_mean_exp_val = max_mean_exp_val
-                best_step_overall = path_steps[max_path_idx].item()
-                best_tree_id = tid
-                best_depth = max_path_idx
-                best_path_len = len(path)
-
-        if best_step_overall is None:
-            print(f"    New Tree: best_mean_exp={best_mean_exp_val:.4f}")
-            selected.append(-(num_env_trees + 1))
-        else:
-            search_count[env_idx][best_tree_id] = search_count[env_idx].get(best_tree_id, 0) + 1
-            print(
-                f"    Tree Search: env_idx={env_idx}, tree_id={best_tree_id}, "
-                f"mean_exp={best_mean_exp_val:.4f}, "
-                f"search_count={search_count[env_idx][best_tree_id]}, "
-                f"depth={best_depth} / {best_path_len}"
-            )
-            selected.append(best_step_overall)
+        best_t = int(torch.where(mask, max_exp_val, neg_inf).argmax().item())
+        best_tid = active_tids[best_t]
+        search_count[env_idx][best_tid] = search_count[env_idx].get(best_tid, 0) + 1
+        print(
+            f"    Tree Search: env_idx={env_idx}, tree_id={best_tid}, "
+            f"mean_exp={max_exp_val[best_t].item():.4f}, "
+            f"search_count={search_count[env_idx][best_tid]}, "
+            f"depth={int(max_pos[best_t].item())} / {int(n_t[best_t].item())}"
+        )
+        selected.append(int(best_step[best_t].item()))
 
     return selected
 
@@ -881,44 +889,41 @@ if __name__ == "__main__":
                         gae_lambda=args.gae_lambda,
                     )
 
-                skip_search = step >= args.num_steps - 1
+                if step < args.num_steps - 1:
+                    selected = select_next_states(
+                        terminated_envs=terminated_envs,
+                        current_step=step,
+                        advantages=advantages,
+                        parent_indices=parent_indices,
+                        tree_indices=tree_indices,
+                        search_count=search_count,
+                        max_search=args.max_search_per_tree,
+                        max_exploitations=max_exploitations,
+                        skip_init_search=skip_init_search,
+                        c=args.c,
+                        gamma=args.gamma,
+                        tau=args.tau,
+                    )
 
-                selected = select_next_states(
-                    terminated_envs=terminated_envs,
-                    current_step=step,
-                    num_steps=args.num_steps,
-                    advantages=advantages,
-                    parent_indices=parent_indices,
-                    tree_indices=tree_indices,
-                    skip_search=skip_search,
-                    search_count=search_count,
-                    max_search=args.max_search_per_tree,
-                    max_exploitations=max_exploitations,
-                    skip_init_search=skip_init_search,
-                    c=args.c,
-                    gamma=args.gamma,
-                    tau=args.tau,
-                )
-
-                # OTRC selection and state restoration
-                for i, env_idx in enumerate(terminated_envs):
-                    if selected[i] < 0:
-                        # Variance is stable, start a new tree
-                        obs_data, _ = envs[env_idx].reset()
-                        next_obs[env_idx] = torch.Tensor(obs_data).to(device)
-                        root_states[env_idx].insert(0, envs[env_idx].clone_state())
-                        current_parent[env_idx] = -len(root_states[env_idx])
-                        max_episodic_return[env_idx] = float('-inf')
-                    else:
-                        # Continue searching
-                        parent = parent_indices[selected[i], env_idx].item()
-                        if parent < 0:
-                            envs[env_idx].restore_state(root_states[env_idx][parent])
+                    # OTRC selection and state restoration
+                    for i, env_idx in enumerate(terminated_envs):
+                        if selected[i] < 0:
+                            # Variance is stable, start a new tree
+                            obs_data, _ = envs[env_idx].reset()
+                            next_obs[env_idx] = torch.Tensor(obs_data).to(device)
+                            root_states[env_idx].insert(0, envs[env_idx].clone_state())
+                            current_parent[env_idx] = -len(root_states[env_idx])
+                            max_episodic_return[env_idx] = float('-inf')
                         else:
-                            envs[env_idx].restore_state(env_states[parent][env_idx])
-                            state_branches[parent, env_idx] += 1
-                        next_obs[env_idx] = obs[selected[i], env_idx]
-                        current_parent[env_idx] = parent
+                            # Continue searching
+                            parent = parent_indices[selected[i], env_idx].item()
+                            if parent < 0:
+                                envs[env_idx].restore_state(root_states[env_idx][parent])
+                            else:
+                                envs[env_idx].restore_state(env_states[parent][env_idx])
+                                state_branches[parent, env_idx] += 1
+                            next_obs[env_idx] = obs[selected[i], env_idx]
+                            current_parent[env_idx] = parent
 
         # Bootstrap value for non-terminal leaf nodes and recompute advantages
         with torch.no_grad():
