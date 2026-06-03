@@ -46,13 +46,13 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "HalfCheetah-v4"
     """the id of the environment"""
-    total_timesteps: int = 3000000
+    total_timesteps: int = 1000000
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
     num_envs: int = 1
     """the number of parallel game environments"""
-    num_steps: int = 4096
+    num_steps: int = 2048
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
@@ -724,12 +724,17 @@ if __name__ == "__main__":
     envs = [make_env(args.env_id, i, args.capture_video, run_name, args.gamma)() for i in range(args.num_envs)]
     assert isinstance(envs[0].action_space, gym.spaces.Box), "only continuous action space is supported"
 
-    # SyncVectorEnv for Agent init (cleanrl convention), envs list for actual training
-    envs_vec = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
-    )
-    agent = Agent(envs_vec).to(device)
-    envs_vec.close()
+    # Agent only needs CleanRL-style single_*_space attributes for network shapes.
+    # Use the training env spaces directly to avoid constructing a second set of envs.
+    agent_env_spaces = type(
+        "AgentEnvSpaces",
+        (),
+        {
+            "single_observation_space": envs[0].observation_space,
+            "single_action_space": envs[0].action_space,
+        },
+    )()
+    agent = Agent(agent_env_spaces).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
