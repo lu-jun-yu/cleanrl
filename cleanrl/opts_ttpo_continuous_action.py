@@ -1044,7 +1044,7 @@ if __name__ == "__main__":
                 w_sum = w.sum()
                 if args.norm_adv:
                     mb_advantages_mean = (mb_advantages * w).sum() / w_sum
-                    mb_advantages_var = ((mb_advantages - mb_advantages_mean) ** 2 * w).sum() * (w_sum - 1)
+                    mb_advantages_var = ((mb_advantages - mb_advantages_mean) ** 2 * w).sum() / (w_sum - 1)
                     mb_advantages_std = torch.sqrt(mb_advantages_var)
                     mb_advantages = (mb_advantages - mb_advantages_mean) / (mb_advantages_std + 1e-8)
 
