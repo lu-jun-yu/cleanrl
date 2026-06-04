@@ -693,7 +693,7 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260603"
+    algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260605"
     if args.track:
         import wandb
 
@@ -1041,11 +1041,9 @@ if __name__ == "__main__":
                 mb_weights = b_weights[mb_inds]
                 w = 1.0 / mb_weights
                 w_sum = w.sum()
-                w_sq_sum = (w ** 2).sum()
-                unbiased_var_factor = w_sum / (w_sum ** 2 - w_sq_sum)
                 if args.norm_adv:
                     mb_advantages_mean = (mb_advantages * w).sum() / w_sum
-                    mb_advantages_var = ((mb_advantages - mb_advantages_mean) ** 2 * w).sum() * unbiased_var_factor
+                    mb_advantages_var = ((mb_advantages - mb_advantages_mean) ** 2 * w).sum() * (w_sum - 1)
                     mb_advantages_std = torch.sqrt(mb_advantages_var)
                     mb_advantages = (mb_advantages - mb_advantages_mean) / (mb_advantages_std + 1e-8)
 
