@@ -461,8 +461,9 @@ def select_next_states(
     best_child = torch.full((N,), -1, device=device, dtype=torch.long)
     best_child.scatter_reduce_(0, parent_of_child[qual], child_nodes[qual], reduce="amin", include_self=False)
 
-    _, inv, counts = torch.unique((sub_par * E + e_grid).reshape(-1), return_inverse=True, return_counts=True)
-    sibling_count = counts[inv].to(dtype)
+    sibling_count = torch.ones((N,), device=device, dtype=dtype)
+    _, inv, counts = torch.unique(parent_of_child, return_inverse=True, return_counts=True)
+    sibling_count[child_nodes] = counts[inv].to(dtype)
 
     active_tids, roots, tree_e_local = [], [], []
     env_num_trees = [0] * E
@@ -560,7 +561,7 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260413"
+    algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260605"
     if args.track:
         import wandb
 
@@ -591,12 +592,17 @@ if __name__ == "__main__":
     envs = [make_env(args.env_id, i, args.capture_video, run_name)() for i in range(args.num_envs)]
     assert isinstance(envs[0].action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    # SyncVectorEnv for Agent init (cleanrl convention), envs list for actual training
-    envs_vec = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)]
-    )
-    agent = Agent(envs_vec).to(device)
-    envs_vec.close()
+    # Agent only needs CleanRL-style single_*_space attributes for network shapes.
+    # Use the training env spaces directly to avoid constructing a second set of envs.
+    agent_env_spaces = type(
+        "AgentEnvSpaces",
+        (),
+        {
+            "single_observation_space": envs[0].observation_space,
+            "single_action_space": envs[0].action_space,
+        },
+    )()
+    agent = Agent(agent_env_spaces).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
@@ -902,10 +908,11 @@ if __name__ == "__main__":
 
                 mb_advantages = b_advantages[mb_inds]
                 mb_weights = b_weights[mb_inds]
-                mb_weights_sum = (1.0 / mb_weights).sum()
+                w = 1.0 / mb_weights
+                w_sum = w.sum()
                 if args.norm_adv:
-                    mb_advantages_mean = (mb_advantages / mb_weights).sum() / mb_weights_sum
-                    mb_advantages_var = ((mb_advantages - mb_advantages_mean) ** 2 / mb_weights).sum() / mb_weights_sum
+                    mb_advantages_mean = (mb_advantages * w).sum() / w_sum
+                    mb_advantages_var = ((mb_advantages - mb_advantages_mean) ** 2 * w).sum() * (w_sum - 1)
                     mb_advantages_std = torch.sqrt(mb_advantages_var)
                     mb_advantages = (mb_advantages - mb_advantages_mean) / (mb_advantages_std + 1e-8)
 
@@ -913,7 +920,7 @@ if __name__ == "__main__":
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss_per_sample = torch.max(pg_loss1, pg_loss2)
-                pg_loss = (pg_loss_per_sample / mb_weights).sum() / mb_weights_sum
+                pg_loss = (pg_loss_per_sample * w).sum() / w_sum
 
                 # Value loss (weighted by branch factors)
                 newvalue = newvalue.view(-1)
@@ -926,10 +933,10 @@ if __name__ == "__main__":
                     )
                     v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * (v_loss_max / mb_weights).sum() / mb_weights_sum
+                    v_loss = 0.5 * (v_loss_max * w).sum() / w_sum
                 else:
                     v_loss_per_sample = (newvalue - b_returns[mb_inds]) ** 2
-                    v_loss = 0.5 * (v_loss_per_sample / mb_weights).sum() / mb_weights_sum
+                    v_loss = 0.5 * (v_loss_per_sample * w).sum() / w_sum
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef

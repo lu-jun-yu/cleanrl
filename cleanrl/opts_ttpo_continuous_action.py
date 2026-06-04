@@ -594,8 +594,9 @@ def select_next_states(
     best_child = torch.full((N,), -1, device=device, dtype=torch.long)
     best_child.scatter_reduce_(0, parent_of_child[qual], child_nodes[qual], reduce="amin", include_self=False)
 
-    _, inv, counts = torch.unique((sub_par * E + e_grid).reshape(-1), return_inverse=True, return_counts=True)
-    sibling_count = counts[inv].to(dtype)
+    sibling_count = torch.ones((N,), device=device, dtype=dtype)
+    _, inv, counts = torch.unique(parent_of_child, return_inverse=True, return_counts=True)
+    sibling_count[child_nodes] = counts[inv].to(dtype)
 
     active_tids, roots, tree_e_local = [], [], []
     env_num_trees = [0] * E
