@@ -105,6 +105,15 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
     return thunk
 
 
+def find_wrapper(env, wrapper_type):
+    current = env
+    while current is not None:
+        if isinstance(current, wrapper_type):
+            return current
+        current = getattr(current, "env", None)
+    return None
+
+
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
@@ -358,6 +367,27 @@ if __name__ == "__main__":
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
         torch.save(agent.state_dict(), model_path)
         print(f"model saved to {model_path}")
+
+        # Save complete checkpoint (model weights + normalization running stats)
+        checkpoint = {"model_state_dict": agent.state_dict()}
+        env0 = envs.envs[0] if hasattr(envs, "envs") else envs
+        normalize_obs_wrapper = find_wrapper(env0, gym.wrappers.NormalizeObservation)
+        if normalize_obs_wrapper is not None and hasattr(normalize_obs_wrapper, "obs_rms"):
+            obs_rms = normalize_obs_wrapper.obs_rms
+            checkpoint["obs_rms_mean"] = np.array(obs_rms.mean, copy=True)
+            checkpoint["obs_rms_var"] = np.array(obs_rms.var, copy=True)
+            checkpoint["obs_rms_count"] = float(obs_rms.count)
+        normalize_reward_wrapper = find_wrapper(env0, gym.wrappers.NormalizeReward)
+        if normalize_reward_wrapper is not None and hasattr(normalize_reward_wrapper, "return_rms"):
+            ret_rms = normalize_reward_wrapper.return_rms
+            checkpoint["ret_rms_mean"] = np.array(ret_rms.mean, copy=True)
+            checkpoint["ret_rms_var"] = np.array(ret_rms.var, copy=True)
+            checkpoint["ret_rms_count"] = float(ret_rms.count)
+        ckpt_dir = f"checkpoints/{args.env_id}"
+        os.makedirs(ckpt_dir, exist_ok=True)
+        ckpt_path = f"{ckpt_dir}/seed{args.seed}.pt"
+        torch.save(checkpoint, ckpt_path)
+        print(f"complete checkpoint saved to {ckpt_path}")
 
         if args.upload_model:
             from cleanrl_utils.evals.ppo_eval import evaluate
