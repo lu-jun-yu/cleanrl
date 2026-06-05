@@ -85,8 +85,6 @@ class Args:
     """tau for the OTRC node selection"""
     max_search_per_tree: int = 6
     """maximum number of tree searches per environment per iteration"""
-    c: float = 1.0
-    """exploration coefficient for OTRC node selection"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -424,9 +422,8 @@ def select_next_states(
     tree_indices: torch.Tensor,
     search_count: list[dict],
     max_search: int,
-    max_exploitations: list[dict],
+    max_otrc_scores: list[dict],
     skip_init_search: list[bool],
-    c: float = 1.0,
     gamma: float = 0.99,
     tau: float = 0.7,
 ) -> list[int]:
@@ -460,10 +457,6 @@ def select_next_states(
     qual = child_adv == group_max[parent_of_child]
     best_child = torch.full((N,), -1, device=device, dtype=torch.long)
     best_child.scatter_reduce_(0, parent_of_child[qual], child_nodes[qual], reduce="amin", include_self=False)
-
-    sibling_count = torch.ones((N,), device=device, dtype=dtype)
-    _, inv, counts = torch.unique(parent_of_child, return_inverse=True, return_counts=True)
-    sibling_count[child_nodes] = counts[inv].to(dtype)
 
     active_tids, roots, tree_e_local = [], [], []
     env_num_trees = [0] * E
@@ -508,45 +501,38 @@ def select_next_states(
 
         path_adv = sub_advs.reshape(-1)[path_idx].masked_fill(~path_mask, 0.0)
         path_adv[row, virtual_pos] = 0.0
-        exploitation = torch.zeros_like(path_adv)
+        otrc_score = torch.zeros_like(path_adv)
         discounted = torch.zeros(T, device=device, dtype=dtype)
         for k in range(path_idx.shape[1] - 1, -1, -1):
             m = path_mask[:, k].to(dtype)
             discounted = (-path_adv[:, k] + gamma * discounted) * m + discounted * (1 - m)
             divisor = torch.where(path_mask[:, k], n_t - k, 1).to(dtype) ** tau
-            exploitation[:, k] = torch.where(path_mask[:, k], discounted / divisor, torch.zeros_like(discounted))
+            otrc_score[:, k] = torch.where(path_mask[:, k], discounted / divisor, torch.zeros_like(discounted))
 
-        max_abs = exploitation.abs().amax(dim=1)
-        max_abs = torch.where(max_abs == 0, torch.ones_like(max_abs), max_abs)
-        path_sibling = sibling_count[path_idx]
-        path_sibling[row, virtual_pos] = 1
-        exploration = (path_sibling - 1) * max_abs.unsqueeze(1)
-        otrc = exploitation - c * exploration
-
-        max_pos = torch.where(path_mask, otrc, neg_inf).argmax(dim=1)
-        max_exp_val = exploitation[row, max_pos]
+        max_pos = torch.where(path_mask, otrc_score, neg_inf).argmax(dim=1)
+        max_otrc_score = otrc_score[row, max_pos]
         best_step = path_idx[row, max_pos] // E
 
         for i, tid in enumerate(active_tids):
-            max_exploitations[terminated_envs[tree_e_local[i]]].setdefault(tid, float(max_exp_val[i].item()))
+            max_otrc_scores[terminated_envs[tree_e_local[i]]].setdefault(tid, float(max_otrc_score[i].item()))
 
-        pool = [v for d in max_exploitations for v in d.values()]
+        pool = [v for d in max_otrc_scores for v in d.values()]
         if len(pool) > 1:
-            eligible = max_exp_val > float(np.mean(pool))
+            eligible = max_otrc_score > float(np.mean(pool))
 
     for e_local, env_idx in enumerate(terminated_envs):
         mask = (e_local_arr == e_local) & eligible
         if not bool(mask.any()):
-            print(f"    New Tree: best_mean_exp={float('-inf'):.4f}")
+            print(f"    New Tree: best_otrc_score={float('-inf'):.4f}")
             selected.append(-(env_num_trees[e_local] + 1))
             continue
 
-        best_t = int(torch.where(mask, max_exp_val, neg_inf).argmax().item())
+        best_t = int(torch.where(mask, max_otrc_score, neg_inf).argmax().item())
         best_tid = active_tids[best_t]
         search_count[env_idx][best_tid] = search_count[env_idx].get(best_tid, 0) + 1
         print(
             f"    Tree Search: env_idx={env_idx}, tree_id={best_tid}, "
-            f"mean_exp={max_exp_val[best_t].item():.4f}, "
+            f"otrc_score={max_otrc_score[best_t].item():.4f}, "
             f"search_count={search_count[env_idx][best_tid]}, "
             f"depth={int(max_pos[best_t].item())} / {int(n_t[best_t].item())}"
         )
@@ -652,8 +638,8 @@ if __name__ == "__main__":
         # search count per tree (inherit from previous iteration for continuing envs)
         search_count = [{} for _ in range(args.num_envs)]
 
-        # pooled mean-exploitation stats for tree filtering (verify_scaling_variance v2)
-        max_exploitations = [{} for _ in range(args.num_envs)]
+        # pooled mean-otrc_score stats for tree filtering (verify_scaling_variance v2)
+        max_otrc_scores = [{} for _ in range(args.num_envs)]
 
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
@@ -771,9 +757,8 @@ if __name__ == "__main__":
                         tree_indices=tree_indices,
                         search_count=search_count,
                         max_search=args.max_search_per_tree,
-                        max_exploitations=max_exploitations,
+                        max_otrc_scores=max_otrc_scores,
                         skip_init_search=skip_init_search,
-                        c=args.c,
                         gamma=args.gamma,
                         tau=args.tau,
                     )
