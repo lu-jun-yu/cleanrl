@@ -44,6 +44,16 @@ class Args:
     """the entity (team) of wandb's project"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
+    resume: bool = False
+    """whether to resume training from a checkpoint"""
+    resume_path: str = ""
+    """checkpoint path to resume from; defaults to checkpoint_dir/env_id/seed{seed}.pt"""
+    save_checkpoint: bool = True
+    """whether to save a resumable training checkpoint"""
+    checkpoint_dir: str = "checkpoints/atari"
+    """root directory for resumable training checkpoints"""
+    checkpoint_interval: int = 100
+    """save a checkpoint every N iterations"""
 
     # Algorithm specific arguments
     env_id: str = "BreakoutNoFrameskip-v4"
@@ -83,7 +93,7 @@ class Args:
 
     tau: float = 0.7
     """tau for the OTRC node selection"""
-    max_search_per_tree: int = 6
+    max_search_per_tree: int = 4
     """maximum number of tree searches per environment per iteration"""
 
     # to be filled in runtime
@@ -141,22 +151,12 @@ class AtariStateSnapshotWrapper(gym.Wrapper):
         """Step the environment and capture episode statistics for snapshot."""
         obs, reward, terminated, truncated, info = self.env.step(action)
 
-        # Capture RecordEpisodeStatistics values for state snapshot
-        if terminated or truncated:
-            # Episode ended - get the true total from info (RecordEpisodeStatistics already reset)
-            if 'episode' in info:
-                ep_r = info['episode']['r']
-                ep_l = info['episode']['l']
-                self._episode_return_snapshot = float(ep_r[0] if hasattr(ep_r, '__getitem__') else ep_r)
-                self._episode_length_snapshot = int(ep_l[0] if hasattr(ep_l, '__getitem__') else ep_l)
-            else:
-                self._episode_return_snapshot = 0.0
-                self._episode_length_snapshot = 0
-        else:
-            # Mid-episode - get current accumulated value from RecordEpisodeStatistics
-            if self._record_stats_wrapper is not None:
-                self._episode_return_snapshot = float(self._record_stats_wrapper.episode_returns[0])
-                self._episode_length_snapshot = int(self._record_stats_wrapper.episode_lengths[0])
+        # Keep a best-effort scalar mirror for diagnostics. Clone/restore uses the
+        # wrapper's full arrays directly because EpisodicLifeEnv can emit terminal
+        # signals on life loss while RecordEpisodeStatistics must keep counting.
+        if self._record_stats_wrapper is not None and self._record_stats_wrapper.episode_returns is not None:
+            self._episode_return_snapshot = float(self._record_stats_wrapper.episode_returns[0])
+            self._episode_length_snapshot = int(self._record_stats_wrapper.episode_lengths[0])
 
         return obs, reward, terminated, truncated, info
 
@@ -170,18 +170,32 @@ class AtariStateSnapshotWrapper(gym.Wrapper):
 
     def clone_state(self):
         """Clone the current environment state including all wrapper states."""
-        ale_state = self.ale.cloneState()
+        if hasattr(self.ale, "cloneSystemState"):
+            ale_state = ("system", self.ale.cloneSystemState())
+        else:
+            ale_state = ("emulator", self.ale.cloneState())
 
         # Save TimeLimit state
         timelimit_steps = None
         if self._timelimit_wrapper is not None:
             timelimit_steps = self._timelimit_wrapper._elapsed_steps
 
-        # Save episode stats snapshot (captured in step() before any reset)
-        record_stats = {
-            'episode_returns': self._episode_return_snapshot,
-            'episode_lengths': self._episode_length_snapshot,
-        }
+        # Save RecordEpisodeStatistics state. Store the real wrapper arrays instead
+        # of the scalar mirror because life-loss terminals do not reset real episodes.
+        record_stats = None
+        if self._record_stats_wrapper is not None and self._record_stats_wrapper.episode_returns is not None:
+            record_stats = {
+                'episode_returns': np.array(self._record_stats_wrapper.episode_returns, copy=True),
+                'episode_lengths': np.array(self._record_stats_wrapper.episode_lengths, copy=True),
+                'episode_start_times': (
+                    np.array(self._record_stats_wrapper.episode_start_times, copy=True)
+                    if self._record_stats_wrapper.episode_start_times is not None
+                    else None
+                ),
+                'episode_count': int(self._record_stats_wrapper.episode_count),
+                'return_queue': list(self._record_stats_wrapper.return_queue),
+                'length_queue': list(self._record_stats_wrapper.length_queue),
+            }
 
         # Save FrameStack buffer (critical for correct observations)
         framestack_state = None
@@ -218,7 +232,11 @@ class AtariStateSnapshotWrapper(gym.Wrapper):
         ale_state, timelimit_steps, record_stats, framestack_state, maxandskip_state, episodiclife_state = state
 
         # Restore ALE state first
-        self.ale.restoreState(ale_state)
+        ale_state_type, ale_state_payload = ale_state
+        if ale_state_type == "system" and hasattr(self.ale, "restoreSystemState"):
+            self.ale.restoreSystemState(ale_state_payload)
+        else:
+            self.ale.restoreState(ale_state_payload)
 
         # Restore TimeLimit state
         if self._timelimit_wrapper is not None and timelimit_steps is not None:
@@ -226,11 +244,21 @@ class AtariStateSnapshotWrapper(gym.Wrapper):
 
         # Restore RecordEpisodeStatistics state using array indexing
         if self._record_stats_wrapper is not None and record_stats is not None:
-            self._record_stats_wrapper.episode_returns[0] = record_stats['episode_returns']
-            self._record_stats_wrapper.episode_lengths[0] = record_stats['episode_lengths']
+            self._record_stats_wrapper.episode_returns = np.array(record_stats['episode_returns'], copy=True)
+            self._record_stats_wrapper.episode_lengths = np.array(record_stats['episode_lengths'], copy=True)
+            self._record_stats_wrapper.episode_start_times = (
+                np.array(record_stats['episode_start_times'], copy=True)
+                if record_stats['episode_start_times'] is not None
+                else None
+            )
+            self._record_stats_wrapper.episode_count = int(record_stats['episode_count'])
+            self._record_stats_wrapper.return_queue.clear()
+            self._record_stats_wrapper.return_queue.extend(record_stats['return_queue'])
+            self._record_stats_wrapper.length_queue.clear()
+            self._record_stats_wrapper.length_queue.extend(record_stats['length_queue'])
             # Also update our snapshot
-            self._episode_return_snapshot = record_stats['episode_returns']
-            self._episode_length_snapshot = record_stats['episode_lengths']
+            self._episode_return_snapshot = float(self._record_stats_wrapper.episode_returns[0])
+            self._episode_length_snapshot = int(self._record_stats_wrapper.episode_lengths[0])
 
         # Restore FrameStack buffer (critical for correct observations)
         if self._framestack_wrapper is not None and framestack_state is not None:
@@ -254,11 +282,16 @@ class AtariStateSnapshotWrapper(gym.Wrapper):
 
 def make_env(env_id, idx, capture_video, run_name):
     def thunk():
+        make_kwargs = {}
+        if env_id.startswith("ALE/") or env_id.endswith("-v5"):
+            # CleanRL Atari preprocessing expects NoFrameskip-like deterministic
+            # base envs; MaxAndSkipEnv below provides the training frameskip.
+            make_kwargs = {"frameskip": 1, "repeat_action_probability": 0.0}
         if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
+            env = gym.make(env_id, render_mode="rgb_array", **make_kwargs)
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
-            env = gym.make(env_id)
+            env = gym.make(env_id, **make_kwargs)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = NoopResetEnv(env, noop_max=30)
         env = MaxAndSkipEnv(env, skip=4)
@@ -273,6 +306,45 @@ def make_env(env_id, idx, capture_video, run_name):
         return env
 
     return thunk
+
+
+def get_checkpoint_path(args):
+    return os.path.join(args.checkpoint_dir, args.env_id, f"seed{args.seed}.pt")
+
+
+def move_optimizer_state_to_device(optimizer, device):
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
+
+
+def save_training_checkpoint(path, args, run_name, iteration, global_step, agent, optimizer, envs, next_obs, next_done):
+    checkpoint = {
+        "version": 1,
+        "args": vars(args),
+        "run_name": run_name,
+        "iteration": int(iteration),
+        "global_step": int(global_step),
+        "model_state_dict": agent.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "env_states": [env.clone_state() for env in envs],
+        "next_obs": next_obs.detach().cpu(),
+        "next_done": next_done.detach().cpu(),
+        "python_random_state": random.getstate(),
+        "numpy_random_state": np.random.get_state(),
+        "torch_random_state": torch.get_rng_state(),
+        "torch_cuda_random_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    torch.save(checkpoint, tmp_path)
+    os.replace(tmp_path, path)
+    print(f"checkpoint saved to {path}")
+
+
+def load_training_checkpoint(path, device):
+    return torch.load(path, map_location=device, weights_only=False)
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -546,7 +618,22 @@ if __name__ == "__main__":
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    checkpoint_path = args.resume_path if args.resume_path else get_checkpoint_path(args)
+    resume_checkpoint = None
+    if args.resume:
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"resume checkpoint not found: {checkpoint_path}")
+        resume_checkpoint = load_training_checkpoint(checkpoint_path, torch.device("cpu"))
+        print(
+            f"resuming from {checkpoint_path} "
+            f"(iteration={resume_checkpoint['iteration']}, global_step={resume_checkpoint['global_step']})"
+        )
+
+    run_name = (
+        resume_checkpoint.get("run_name")
+        if resume_checkpoint is not None and resume_checkpoint.get("run_name")
+        else f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    )
     algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260605"
     if args.track:
         import wandb
@@ -618,13 +705,42 @@ if __name__ == "__main__":
     start_time = time.time()
     next_obs = torch.zeros((args.num_envs,) + envs[0].observation_space.shape).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
+    start_iteration = 1
 
-    for env_idx, env in enumerate(envs):
-        obs_data, _ = env.reset(seed=args.seed + env_idx)
-        next_obs[env_idx] = torch.Tensor(obs_data).to(device)
-        root_states[env_idx] = [env.clone_state()]
+    if resume_checkpoint is None:
+        for env_idx, env in enumerate(envs):
+            obs_data, _ = env.reset(seed=args.seed + env_idx)
+            next_obs[env_idx] = torch.Tensor(obs_data).to(device)
+            root_states[env_idx] = [env.clone_state()]
+    else:
+        if resume_checkpoint["args"]["num_envs"] != args.num_envs or resume_checkpoint["args"]["num_steps"] != args.num_steps:
+            raise ValueError("resume checkpoint num_envs/num_steps must match current run")
+        agent.load_state_dict(resume_checkpoint["model_state_dict"])
+        optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+        move_optimizer_state_to_device(optimizer, device)
 
-    for iteration in range(1, args.num_iterations + 1):
+        for env, env_state in zip(envs, resume_checkpoint["env_states"]):
+            env.reset()
+            env.restore_state(env_state)
+
+        next_obs = resume_checkpoint["next_obs"].to(device)
+        next_done = resume_checkpoint["next_done"].to(device)
+        global_step = int(resume_checkpoint["global_step"])
+        start_iteration = int(resume_checkpoint["iteration"]) + 1
+
+        random.setstate(resume_checkpoint["python_random_state"])
+        np.random.set_state(resume_checkpoint["numpy_random_state"])
+        torch.set_rng_state(resume_checkpoint["torch_random_state"].cpu())
+        cuda_rng_state = resume_checkpoint.get("torch_cuda_random_state_all")
+        if cuda_rng_state is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(cuda_rng_state)
+
+        for env_idx, env in enumerate(envs):
+            root_states[env_idx] = [env.clone_state()]
+
+    session_start_step = global_step
+
+    for iteration in range(start_iteration, args.num_iterations + 1):
         # Initialize episodic_returns for this iteration
         episodic_returns = []
         episodic_return_info = []  # (episodic_return, tid, step, env_idx)
@@ -897,7 +1013,7 @@ if __name__ == "__main__":
                 w_sum = w.sum()
                 if args.norm_adv:
                     mb_advantages_mean = (mb_advantages * w).sum() / w_sum
-                    mb_advantages_var = ((mb_advantages - mb_advantages_mean) ** 2 * w).sum() * (w_sum - 1)
+                    mb_advantages_var = ((mb_advantages - mb_advantages_mean) ** 2 * w).sum() / (w_sum - 1)
                     mb_advantages_std = torch.sqrt(mb_advantages_var)
                     mb_advantages = (mb_advantages - mb_advantages_mean) / (mb_advantages_std + 1e-8)
 
@@ -947,9 +1063,29 @@ if __name__ == "__main__":
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        print("SPS:", int(global_step / (time.time() - start_time)))
+        session_steps = max(global_step - session_start_step, 1)
+        sps = int(session_steps / (time.time() - start_time))
+        print("SPS:", sps)
         print()
-        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+        writer.add_scalar("charts/SPS", sps, global_step)
+
+        if (
+            args.save_checkpoint
+            and args.checkpoint_interval > 0
+            and (iteration % args.checkpoint_interval == 0 or iteration == args.num_iterations)
+        ):
+            save_training_checkpoint(
+                checkpoint_path,
+                args,
+                run_name,
+                iteration,
+                global_step,
+                agent,
+                optimizer,
+                envs,
+                next_obs,
+                next_done,
+            )
 
     for env in envs:
         env.close()

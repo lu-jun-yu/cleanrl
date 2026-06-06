@@ -81,7 +81,7 @@ class Args:
 
     tau: float = 0.7
     """tau for the OTRC node selection"""
-    max_search_per_tree: int = 4
+    max_search_per_tree: int = 1
     """maximum number of tree searches per environment per iteration"""
 
     # to be filled in runtime
