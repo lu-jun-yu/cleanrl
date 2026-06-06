@@ -4,9 +4,8 @@ import os
 import random
 import time
 import json
-from datetime import datetime
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import List
 
 import gymnasium as gym
 import numpy as np
@@ -24,6 +23,8 @@ from cleanrl_utils.atari_wrappers import (  # isort:skip
     MaxAndSkipEnv,
     NoopResetEnv,
 )
+
+from opts_ttpo_core import compute_branch_weight, compute_tree_gae, select_next_states
 
 
 @dataclass
@@ -225,11 +226,20 @@ class AtariStateSnapshotWrapper(gym.Wrapper):
                 'was_real_done': self._episodiclife_wrapper.was_real_done,
             }
 
-        return (ale_state, timelimit_steps, record_stats, framestack_state, maxandskip_state, episodiclife_state)
+        # Save underlying RNG state (NoopResetEnv samples no-op counts from it)
+        rng_state = None
+        try:
+            if self.unwrapped.np_random is not None:
+                rng_state = self.unwrapped.np_random.bit_generator.state
+        except Exception:
+            rng_state = None
+
+        return (ale_state, timelimit_steps, record_stats, framestack_state, maxandskip_state, episodiclife_state, rng_state)
 
     def restore_state(self, state):
         """Restore the environment to a previous state including all wrapper states."""
-        ale_state, timelimit_steps, record_stats, framestack_state, maxandskip_state, episodiclife_state = state
+        ale_state, timelimit_steps, record_stats, framestack_state, maxandskip_state, episodiclife_state = state[:6]
+        rng_state = state[6] if len(state) > 6 else None
 
         # Restore ALE state first
         ale_state_type, ale_state_payload = ale_state
@@ -278,6 +288,13 @@ class AtariStateSnapshotWrapper(gym.Wrapper):
         if self._episodiclife_wrapper is not None and episodiclife_state is not None:
             self._episodiclife_wrapper.lives = episodiclife_state['lives']
             self._episodiclife_wrapper.was_real_done = episodiclife_state['was_real_done']
+
+        # Restore underlying RNG state
+        try:
+            if rng_state is not None and self.unwrapped.np_random is not None:
+                self.unwrapped.np_random.bit_generator.state = rng_state
+        except Exception:
+            pass
 
 
 def make_env(env_id, idx, capture_video, run_name):
@@ -382,237 +399,6 @@ class Agent(nn.Module):
         return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
 
 
-def compute_tree_gae(
-    terminal_step: int,
-    env_idx: int,
-    rewards: torch.Tensor,
-    values: torch.Tensor,
-    dones: torch.Tensor,
-    parent_indices: torch.Tensor,
-    advantages: torch.Tensor,
-    gamma: float,
-    gae_lambda: float,
-    next_value: float = 0.0,
-):
-    """
-    Compute TreeGAE advantages from terminal node back to root.
-    Synchronizes advantages for identical state-action pairs.
-
-    Args:
-        terminal_step: The step index of the terminal node
-        env_idx: The environment index
-        rewards, values, dones, parent_indices: Tree data tensors
-        advantages: Tensor to store computed advantages (modified in-place)
-        gamma, gae_lambda: GAE parameters
-        next_value: Bootstrap value for non-terminal leaf nodes
-    """
-    current = terminal_step
-
-    while True:
-        # By this implementation's indexing: values[current] is the value of the
-        # state at the current tree node (after its parent action).
-        V_current = values[current, env_idx]
-
-        # V_next uses the child node's stored value (same parent-state index semantics).
-        children = (parent_indices[: terminal_step + 1, env_idx] == current).nonzero(as_tuple=True)[0].tolist()
-        if len(children) == 0:
-            V_next = 0.0 if dones[current, env_idx] else next_value
-        else:
-            V_next = values[children[0], env_idx]
-
-        # Compute delta and advantage
-        delta = rewards[current, env_idx] + gamma * V_next - V_current
-        if len(children) == 0:
-            advantages[current, env_idx] = delta
-        else:
-            # Branch node
-            child_advs = torch.stack([advantages[child, env_idx] for child in children])
-            mean_child_adv = child_advs.mean()
-            advantages[current, env_idx] = delta + gamma * gae_lambda * mean_child_adv
-
-        # Move to parent (parent < 0 means root node)
-        parent = parent_indices[current, env_idx].item()
-        if parent < 0:
-            break
-        current = parent
-
-
-def compute_branch_weight(
-    num_steps: int,
-    parent_indices: torch.Tensor,
-    state_branches: torch.Tensor,
-    env_indices: List[int],
-    root_branch_counts: List[dict],
-) -> torch.Tensor:
-    """
-    Compute branch weight factors for specified environments.
-    W_t = W_parent * state_branches[parent]
-
-    For root nodes (parent < 0), the initial weight is the number of branches
-    originating from the same root state (from root_branch_counts).
-
-    Args:
-        num_steps: Number of steps collected
-        parent_indices: Parent indices tensor (num_steps, num_envs)
-        state_branches: State branches tensor (num_steps, num_envs)
-        env_indices: List of environment indices to compute weights for
-        root_branch_counts: List of dicts mapping root_id -> branch_count for each env
-
-    Returns:
-        weights: (num_steps, len(env_indices)) tensor of branch weight factors
-    """
-    device = parent_indices.device
-    n_envs = len(env_indices)
-    env_t = torch.tensor(env_indices, device=device, dtype=torch.long)
-
-    weights = torch.ones((num_steps, n_envs), device=device, dtype=torch.float32)
-    for step in range(num_steps):
-        p_steps = parent_indices[step, env_t]
-        is_root = p_steps < 0
-
-        for i in is_root.nonzero(as_tuple=True)[0].tolist():
-            env_idx = env_indices[i]
-            tree_root_id = p_steps[i].item()
-            weights[step, i] = root_branch_counts[env_idx].get(tree_root_id, 1)
-
-        if not is_root.all():
-            valid_parents = p_steps[~is_root]
-            valid_env_t = env_t[~is_root]
-            valid_indices = torch.arange(n_envs, device=device)[~is_root]
-            p_weights = weights[valid_parents, valid_indices]
-            p_branches = state_branches[valid_parents, valid_env_t]
-            weights[step, ~is_root] = p_weights * p_branches
-
-    return weights
-
-
-def select_next_states(
-    terminated_envs: list[int],
-    current_step: int,
-    advantages: torch.Tensor,
-    parent_indices: torch.Tensor,
-    tree_indices: torch.Tensor,
-    search_count: list[dict],
-    max_search: int,
-    max_otrc_scores: list[dict],
-    skip_init_search: list[bool],
-    gamma: float = 0.99,
-    tau: float = 0.7,
-) -> list[int]:
-    """
-    OPTS-TTPO node selection, vectorized over all terminated envs' trees at once (flat id = step*E + e_local).
-    Trees are registered first, then gated in one order-independent pass; selection stays per-env.
-    """
-    selected = []
-    n_steps = current_step + 1
-    device = advantages.device
-    dtype = advantages.dtype
-    neg_inf = torch.tensor(float("-inf"), device=device, dtype=dtype)
-
-    E = len(terminated_envs)
-    env_arr = torch.tensor(terminated_envs, device=device, dtype=torch.long)
-    sub_par = parent_indices[:n_steps, env_arr]
-    sub_advs = advantages[:n_steps, env_arr]
-    sub_trees = tree_indices[:n_steps, env_arr]
-    N = n_steps * E
-
-    # flat id = step*E + e_local; a child and its parent share e_local, so envs never mix.
-    step_grid = torch.arange(n_steps, device=device).unsqueeze(1).expand(n_steps, E)
-    e_grid = torch.arange(E, device=device).unsqueeze(0).expand(n_steps, E)
-
-    is_child = sub_par >= 0
-    child_nodes = (step_grid * E + e_grid)[is_child]
-    parent_of_child = (sub_par * E + e_grid)[is_child]
-    child_adv = sub_advs[is_child]
-    group_max = torch.full((N,), float("-inf"), device=device, dtype=dtype)
-    group_max.scatter_reduce_(0, parent_of_child, child_adv, reduce="amax", include_self=True)
-    qual = child_adv == group_max[parent_of_child]
-    best_child = torch.full((N,), -1, device=device, dtype=torch.long)
-    best_child.scatter_reduce_(0, parent_of_child[qual], child_nodes[qual], reduce="amin", include_self=False)
-
-    active_tids, roots, tree_e_local = [], [], []
-    env_num_trees = [0] * E
-    for e_local, env_idx in enumerate(terminated_envs):
-        col_trees = sub_trees[:, e_local]
-        col_parents = sub_par[:, e_local]
-        col_advs = sub_advs[:, e_local]
-        env_tree_ids = torch.unique(col_trees).tolist()
-        env_num_trees[e_local] = len(env_tree_ids)
-        for tid in env_tree_ids:
-            if (skip_init_search[env_idx] and tid == -1) or search_count[env_idx].get(tid, 0) >= max_search:
-                continue
-            root_steps = ((col_trees == tid) & (col_parents < 0)).nonzero(as_tuple=True)[0]
-            active_tids.append(tid)
-            roots.append(root_steps[col_advs[root_steps].argmax()].item() * E + e_local)
-            tree_e_local.append(e_local)
-
-    T = len(active_tids)
-    eligible = torch.zeros(T, device=device, dtype=torch.bool)
-    e_local_arr = torch.tensor(tree_e_local, device=device, dtype=torch.long)
-    if T:
-        cur = torch.tensor(roots, device=device, dtype=torch.long)
-
-        active = torch.ones(T, device=device, dtype=torch.bool)
-        path_cols, mask_cols = [], []
-        while bool(active.any()):
-            path_cols.append(cur)
-            mask_cols.append(active.clone())
-
-            child = best_child[cur]
-            active = active & (child >= 0)
-            cur = torch.where(active, child, cur)
-
-        path_idx = torch.stack(path_cols, dim=1)
-        path_mask = torch.stack(mask_cols, dim=1)
-        row = torch.arange(T, device=device)
-        path_idx = torch.cat([path_idx, cur[:, None]], dim=1)
-        path_mask = torch.cat([path_mask, torch.zeros((T, 1), device=device, dtype=torch.bool)], dim=1)
-        virtual_pos = (~path_mask).int().argmax(dim=1)
-        path_mask[row, virtual_pos] = True
-        n_t = path_mask.sum(dim=1)
-
-        path_adv = sub_advs.reshape(-1)[path_idx].masked_fill(~path_mask, 0.0)
-        path_adv[row, virtual_pos] = 0.0
-        otrc_score = torch.zeros_like(path_adv)
-        discounted = torch.zeros(T, device=device, dtype=dtype)
-        for k in range(path_idx.shape[1] - 1, -1, -1):
-            m = path_mask[:, k].to(dtype)
-            discounted = (-path_adv[:, k] + gamma * discounted) * m + discounted * (1 - m)
-            divisor = torch.where(path_mask[:, k], n_t - k, 1).to(dtype) ** tau
-            otrc_score[:, k] = torch.where(path_mask[:, k], discounted / divisor, torch.zeros_like(discounted))
-
-        max_pos = torch.where(path_mask, otrc_score, neg_inf).argmax(dim=1)
-        max_otrc_score = otrc_score[row, max_pos]
-        best_step = path_idx[row, max_pos] // E
-
-        for i, tid in enumerate(active_tids):
-            max_otrc_scores[terminated_envs[tree_e_local[i]]].setdefault(tid, float(max_otrc_score[i].item()))
-
-        pool = [v for d in max_otrc_scores for v in d.values()]
-        if len(pool) > 1:
-            eligible = max_otrc_score > float(np.mean(pool))
-
-    for e_local, env_idx in enumerate(terminated_envs):
-        mask = (e_local_arr == e_local) & eligible
-        if not bool(mask.any()):
-            print(f"    New Tree: best_otrc_score={float('-inf'):.4f}")
-            selected.append(-(env_num_trees[e_local] + 1))
-            continue
-
-        best_t = int(torch.where(mask, max_otrc_score, neg_inf).argmax().item())
-        best_tid = active_tids[best_t]
-        search_count[env_idx][best_tid] = search_count[env_idx].get(best_tid, 0) + 1
-        print(
-            f"    Tree Search: env_idx={env_idx}, tree_id={best_tid}, "
-            f"otrc_score={max_otrc_score[best_t].item():.4f}, "
-            f"search_count={search_count[env_idx][best_tid]}, "
-            f"depth={int(max_pos[best_t].item())} / {int(n_t[best_t].item())}"
-        )
-        selected.append(int(best_step[best_t].item()))
-
-    return selected
-
-
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -713,8 +499,16 @@ if __name__ == "__main__":
             next_obs[env_idx] = torch.Tensor(obs_data).to(device)
             root_states[env_idx] = [env.clone_state()]
     else:
-        if resume_checkpoint["args"]["num_envs"] != args.num_envs or resume_checkpoint["args"]["num_steps"] != args.num_steps:
-            raise ValueError("resume checkpoint num_envs/num_steps must match current run")
+        required_match_keys = [
+            "env_id", "seed", "num_envs", "num_steps", "num_minibatches",
+            "gamma", "gae_lambda", "tau", "max_search_per_tree",
+        ]
+        mismatched = [k for k in required_match_keys if resume_checkpoint["args"].get(k) != getattr(args, k)]
+        if mismatched:
+            details = ", ".join(
+                f"{k}: checkpoint={resume_checkpoint['args'].get(k)} current={getattr(args, k)}" for k in mismatched
+            )
+            raise ValueError(f"resume checkpoint args must match current run; mismatched -> {details}")
         agent.load_state_dict(resume_checkpoint["model_state_dict"])
         optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
         move_optimizer_state_to_device(optimizer, device)
@@ -740,18 +534,17 @@ if __name__ == "__main__":
 
     session_start_step = global_step
 
+    # weighted mean over a minibatch (w, w_sum are set per-minibatch in the update loop)
+    def wmean(t):
+        return (t * w).sum() / w_sum
+
     for iteration in range(start_iteration, args.num_iterations + 1):
-        # Initialize episodic_returns for this iteration
-        episodic_returns = []
         episodic_return_info = []  # (episodic_return, tid, step, env_idx)
 
-        # Initialize max_episodic_return
-        max_episodic_return = [float('-inf')] * args.num_envs
-
         # OPTS_TTPO: root_branch_counts maintained incrementally
-        root_branch_counts = [{} for _ in range(args.num_envs)]
+        root_branch_counts = [defaultdict(int) for _ in range(args.num_envs)]
 
-        # search count per tree (inherit from previous iteration for continuing envs)
+        # search count per tree (reset each iteration)
         search_count = [{} for _ in range(args.num_envs)]
 
         # pooled mean-otrc_score stats for tree filtering (verify_scaling_variance v2)
@@ -776,7 +569,6 @@ if __name__ == "__main__":
         next_done.zero_()
 
         current_parent = [-1] * args.num_envs
-        next_done.zero_()
         state_branches.fill_(1)
         advantages.zero_()
         parent_indices.fill_(-1)
@@ -809,8 +601,7 @@ if __name__ == "__main__":
 
                 # Update root_branch_counts if this is a root node
                 if p < 0:
-                    root_id = p
-                    root_branch_counts[env_idx][root_id] = root_branch_counts[env_idx].get(root_id, 0) + 1
+                    root_branch_counts[env_idx][p] += 1
 
                 current_parent[env_idx] = step
 
@@ -829,14 +620,10 @@ if __name__ == "__main__":
                     ep_l = info['episode']['l']
                     episodic_return = float(ep_r[0] if hasattr(ep_r, '__getitem__') else ep_r)
                     episodic_length = int(ep_l[0] if hasattr(ep_l, '__getitem__') else ep_l)
-                    episodic_returns.append(episodic_return)
                     episodic_return_info.append((episodic_return, tree_indices[step, env_idx].item(), step, env_idx))
                     print(f"global_step={global_step}, episodic_return={episodic_return:.4f}")
                     writer.add_scalar("charts/episodic_return", episodic_return, global_step)
                     writer.add_scalar("charts/episodic_length", episodic_length, global_step)
-
-                    if episodic_return > max_episodic_return[env_idx]:
-                        max_episodic_return[env_idx] = episodic_return
 
             # Convert to tensors
             next_obs = torch.stack([torch.Tensor(o) for o in next_obs_list]).to(device)
@@ -887,7 +674,6 @@ if __name__ == "__main__":
                             next_obs[env_idx] = torch.Tensor(obs_data).to(device)
                             root_states[env_idx].insert(0, envs[env_idx].clone_state())
                             current_parent[env_idx] = -len(root_states[env_idx])
-                            max_episodic_return[env_idx] = float('-inf')
                         else:
                             # Continue searching
                             parent = parent_indices[selected[i], env_idx].item()
@@ -933,12 +719,9 @@ if __name__ == "__main__":
 
         # Compute tree-weighted aggregated returns
         if episodic_return_info:
-            tid_groups = {}  # (env_idx, tid) -> [(return, step)]
+            tid_groups = defaultdict(list)  # (env_idx, tid) -> [(return, step)]
             for ep_return, tid, ep_step, ei in episodic_return_info:
-                key = (ei, tid)
-                if key not in tid_groups:
-                    tid_groups[key] = []
-                tid_groups[key].append((ep_return, ep_step))
+                tid_groups[(ei, tid)].append((ep_return, ep_step))
 
             aggregated_returns = []
             for (ei, tid), entries in tid_groups.items():
@@ -1012,8 +795,9 @@ if __name__ == "__main__":
                 w = 1.0 / mb_weights
                 w_sum = w.sum()
                 if args.norm_adv:
-                    mb_advantages_mean = (mb_advantages * w).sum() / w_sum
-                    mb_advantages_var = ((mb_advantages - mb_advantages_mean) ** 2 * w).sum() / (w_sum - 1)
+                    mb_advantages_mean = wmean(mb_advantages)
+                    w_sum_corrected = w_sum - 1 if w_sum - 1 > 0 else w_sum
+                    mb_advantages_var = ((mb_advantages - mb_advantages_mean) ** 2 * w).sum() / w_sum_corrected
                     mb_advantages_std = torch.sqrt(mb_advantages_var)
                     mb_advantages = (mb_advantages - mb_advantages_mean) / (mb_advantages_std + 1e-8)
 
@@ -1021,7 +805,7 @@ if __name__ == "__main__":
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss_per_sample = torch.max(pg_loss1, pg_loss2)
-                pg_loss = (pg_loss_per_sample * w).sum() / w_sum
+                pg_loss = wmean(pg_loss_per_sample)
 
                 # Value loss (weighted by branch factors)
                 newvalue = newvalue.view(-1)
@@ -1034,10 +818,10 @@ if __name__ == "__main__":
                     )
                     v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * (v_loss_max * w).sum() / w_sum
+                    v_loss = 0.5 * wmean(v_loss_max)
                 else:
                     v_loss_per_sample = (newvalue - b_returns[mb_inds]) ** 2
-                    v_loss = 0.5 * (v_loss_per_sample * w).sum() / w_sum
+                    v_loss = 0.5 * wmean(v_loss_per_sample)
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
