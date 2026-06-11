@@ -534,9 +534,9 @@ if __name__ == "__main__":
 
     session_start_step = global_step
 
-    # weighted mean over a minibatch (w, w_sum are set per-minibatch in the update loop)
-    def wmean(t):
-        return (t * w).sum() / w_sum
+    # weighted loss aggregation; constant normalizer across minibatches
+    def wagg(t):
+        return (t * w).sum() / loss_norm
 
     for iteration in range(start_iteration, args.num_iterations + 1):
         episodic_return_info = []  # (episodic_return, tid, step, env_idx)
@@ -771,6 +771,14 @@ if __name__ == "__main__":
         b_values = values.reshape(-1)
         b_weights = branch_weights.reshape(-1)
 
+        # OPTS_TTPO: constant loss normalizer + full-batch weighted advantage normalization
+        b_w = 1.0 / b_weights
+        loss_norm = b_w.sum() / args.num_minibatches
+        if args.norm_adv:
+            adv_mean = (b_advantages * b_w).sum() / b_w.sum()
+            adv_var = ((b_advantages - adv_mean) ** 2 * b_w).sum() / (b_w.sum() - 1)
+            b_advantages = (b_advantages - adv_mean) / (torch.sqrt(adv_var) + 1e-8)
+
         # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
         clipfracs = []
@@ -791,21 +799,13 @@ if __name__ == "__main__":
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
                 mb_advantages = b_advantages[mb_inds]
-                mb_weights = b_weights[mb_inds]
-                w = 1.0 / mb_weights
-                w_sum = w.sum()
-                if args.norm_adv:
-                    mb_advantages_mean = wmean(mb_advantages)
-                    w_sum_corrected = w_sum - 1 if w_sum - 1 > 0 else w_sum
-                    mb_advantages_var = ((mb_advantages - mb_advantages_mean) ** 2 * w).sum() / w_sum_corrected
-                    mb_advantages_std = torch.sqrt(mb_advantages_var)
-                    mb_advantages = (mb_advantages - mb_advantages_mean) / (mb_advantages_std + 1e-8)
+                w = b_w[mb_inds]
 
                 # Policy loss (weighted by branch factors)
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss_per_sample = torch.max(pg_loss1, pg_loss2)
-                pg_loss = wmean(pg_loss_per_sample)
+                pg_loss = wagg(pg_loss_per_sample)
 
                 # Value loss (weighted by branch factors)
                 newvalue = newvalue.view(-1)
@@ -818,10 +818,10 @@ if __name__ == "__main__":
                     )
                     v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * wmean(v_loss_max)
+                    v_loss = 0.5 * wagg(v_loss_max)
                 else:
                     v_loss_per_sample = (newvalue - b_returns[mb_inds]) ** 2
-                    v_loss = 0.5 * wmean(v_loss_per_sample)
+                    v_loss = 0.5 * wagg(v_loss_per_sample)
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef

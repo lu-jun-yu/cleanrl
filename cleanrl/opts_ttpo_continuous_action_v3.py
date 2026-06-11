@@ -758,13 +758,9 @@ if __name__ == "__main__":
         b_values = values.reshape(-1)
         b_weights = branch_weights.reshape(-1)
 
-        # OPTS_TTPO: constant loss normalizer + full-batch weighted advantage normalization
+        # OPTS_TTPO: constant loss normalizer (advantage norm is per-minibatch in this v3)
         b_w = 1.0 / b_weights
         loss_norm = b_w.sum() / args.num_minibatches
-        if args.norm_adv:
-            adv_mean = (b_advantages * b_w).sum() / b_w.sum()
-            adv_var = ((b_advantages - adv_mean) ** 2 * b_w).sum() / (b_w.sum() - 1)
-            b_advantages = (b_advantages - adv_mean) / (torch.sqrt(adv_var) + 1e-8)
 
         # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
@@ -787,6 +783,13 @@ if __name__ == "__main__":
 
                 mb_advantages = b_advantages[mb_inds]
                 w = b_w[mb_inds]
+                if args.norm_adv:
+                    w_sum = w.sum()
+                    mb_advantages_mean = (mb_advantages * w).sum() / w_sum
+                    w_sum_corrected = w_sum - 1 if w_sum - 1 > 0 else w_sum
+                    mb_advantages_var = ((mb_advantages - mb_advantages_mean) ** 2 * w).sum() / w_sum_corrected
+                    mb_advantages_std = torch.sqrt(mb_advantages_var)
+                    mb_advantages = (mb_advantages - mb_advantages_mean) / (mb_advantages_std + 1e-8)
 
                 # Policy loss (weighted by branch factors)
                 pg_loss1 = -mb_advantages * ratio
