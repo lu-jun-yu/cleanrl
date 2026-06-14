@@ -776,7 +776,7 @@ if __name__ == "__main__":
         loss_norm = b_w.sum() / args.num_minibatches
         if args.norm_adv:
             adv_mean = (b_advantages * b_w).sum() / b_w.sum()
-            adv_var = ((b_advantages - adv_mean) ** 2 * b_w).sum() / (b_w.sum() - 1)
+            adv_var = ((b_advantages - adv_mean) ** 2 * b_w).sum() / (b_w.sum() - (b_w**2).sum() / b_w.sum())
             b_advantages = (b_advantages - adv_mean) / (torch.sqrt(adv_var) + 1e-8)
 
         # Optimizing the policy and value network
