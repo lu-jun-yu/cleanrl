@@ -213,8 +213,7 @@ def select_next_states(
             max_otrc_scores[terminated_envs[tree_e_local[i]]].setdefault(tid, float(max_otrc_score[i].item()))
 
         pool = [v for d in max_otrc_scores for v in d.values()]
-        if len(pool) > 1:
-            eligible = max_otrc_score > float(np.mean(pool))
+        eligible = max_otrc_score > float(np.mean(pool))
 
     for e_local, env_idx in enumerate(terminated_envs):
         mask = (e_local_arr == e_local) & eligible
