@@ -120,6 +120,8 @@ def select_next_states(
     max_search: int,
     max_otrc_scores: list[dict],
     skip_init_search: list[bool],
+    tree_search_state: list[dict],
+    affected_tree_ids: list[int],
     gamma: float = 0.99,
     tau: float = 0.7,
 ) -> list[int]:
@@ -132,6 +134,7 @@ def select_next_states(
     device = advantages.device
     dtype = advantages.dtype
     neg_inf = torch.tensor(float("-inf"), device=device, dtype=dtype)
+    affected_by_env = {env_idx: {affected_tree_ids[i]} for i, env_idx in enumerate(terminated_envs)}
 
     E = len(terminated_envs)
     env_arr = torch.tensor(terminated_envs, device=device, dtype=torch.long)
@@ -154,25 +157,29 @@ def select_next_states(
     best_child = torch.full((N,), -1, device=device, dtype=torch.long)
     best_child.scatter_reduce_(0, parent_of_child[qual], child_nodes[qual], reduce="amin", include_self=False)
 
-    active_tids, roots, tree_e_local = [], [], []
+    refresh_tids, roots, tree_e_local = [], [], []
     env_num_trees = [0] * E
+    env_tree_ids_by_local = []
     for e_local, env_idx in enumerate(terminated_envs):
         col_trees = sub_trees[:, e_local]
         col_parents = sub_par[:, e_local]
         col_advs = sub_advs[:, e_local]
-        env_tree_ids = torch.unique(col_trees).tolist()
-        env_num_trees[e_local] = len(env_tree_ids)
-        for tid in env_tree_ids:
-            if (skip_init_search[env_idx] and tid == -1) or search_count[env_idx].get(tid, 0) >= max_search:
+        all_tree_ids = torch.unique(col_trees).tolist()
+        searchable_tids = [
+            tid for tid in all_tree_ids
+            if not ((skip_init_search[env_idx] and tid == -1) or search_count[env_idx].get(tid, 0) >= max_search)
+        ]
+        env_tree_ids_by_local.append(searchable_tids)
+        env_num_trees[e_local] = len(all_tree_ids)
+        for tid in searchable_tids:
+            if tid not in affected_by_env[env_idx] and tid in tree_search_state[env_idx]:
                 continue
             root_steps = ((col_trees == tid) & (col_parents < 0)).nonzero(as_tuple=True)[0]
-            active_tids.append(tid)
+            refresh_tids.append(tid)
             roots.append(root_steps[col_advs[root_steps].argmax()].item() * E + e_local)
             tree_e_local.append(e_local)
 
-    T = len(active_tids)
-    eligible = torch.zeros(T, device=device, dtype=torch.bool)
-    e_local_arr = torch.tensor(tree_e_local, device=device, dtype=torch.long)
+    T = len(refresh_tids)
     if T:
         cur = torch.tensor(roots, device=device, dtype=torch.long)
 
@@ -209,28 +216,41 @@ def select_next_states(
         max_otrc_score = otrc_score[row, max_pos]
         best_step = path_idx[row, max_pos] // E
 
-        for i, tid in enumerate(active_tids):
-            max_otrc_scores[terminated_envs[tree_e_local[i]]].setdefault(tid, float(max_otrc_score[i].item()))
+        for i, tid in enumerate(refresh_tids):
+            env_idx = terminated_envs[tree_e_local[i]]
+            score = float(max_otrc_score[i].item())
+            tree_search_state[env_idx][tid] = {
+                "score": score,
+                "step": int(best_step[i].item()),
+                "max_pos": int(max_pos[i].item()),
+                "n_t": int(n_t[i].item()),
+            }
+            max_otrc_scores[env_idx].setdefault(tid, score)
 
-        pool = [v for d in max_otrc_scores for v in d.values()]
-        eligible = max_otrc_score > float(np.mean(pool))
+    pool = [v for d in max_otrc_scores for v in d.values()]
+    mean_threshold = float(np.mean(pool))
 
     for e_local, env_idx in enumerate(terminated_envs):
-        mask = (e_local_arr == e_local) & eligible
-        if not bool(mask.any()):
+        candidates = []
+        for tid in env_tree_ids_by_local[e_local]:
+            state = tree_search_state[env_idx][tid]
+            if state["score"] <= mean_threshold:
+                continue
+            candidates.append((state["score"], tid, state))
+
+        if not candidates:
             print(f"    New Tree: best_otrc_score={float('-inf'):.4f}")
             selected.append(-(env_num_trees[e_local] + 1))
             continue
 
-        best_t = int(torch.where(mask, max_otrc_score, neg_inf).argmax().item())
-        best_tid = active_tids[best_t]
+        score, best_tid, best_state = max(candidates, key=lambda item: item[0])
         search_count[env_idx][best_tid] = search_count[env_idx].get(best_tid, 0) + 1
         print(
             f"    Tree Search: env_idx={env_idx}, tree_id={best_tid}, "
-            f"otrc_score={max_otrc_score[best_t].item():.4f}, "
+            f"otrc_score={score:.4f}, "
             f"search_count={search_count[env_idx][best_tid]}, "
-            f"depth={int(max_pos[best_t].item())} / {int(n_t[best_t].item())}"
+            f"depth={best_state['max_pos']} / {best_state['n_t']}"
         )
-        selected.append(int(best_step[best_t].item()))
+        selected.append(best_state["step"])
 
     return selected

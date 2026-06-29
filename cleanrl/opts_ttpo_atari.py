@@ -549,6 +549,7 @@ if __name__ == "__main__":
 
         # pooled mean-otrc_score stats for tree filtering (verify_scaling_variance v2)
         max_otrc_scores = [{} for _ in range(args.num_envs)]
+        tree_search_state = [{} for _ in range(args.num_envs)]
 
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
@@ -652,6 +653,7 @@ if __name__ == "__main__":
                     )
 
                 if step < args.num_steps - 1:
+                    affected_tree_ids = [int(tree_indices[step, env_idx].item()) for env_idx in terminated_envs]
                     selected = select_next_states(
                         terminated_envs=terminated_envs,
                         current_step=step,
@@ -662,6 +664,8 @@ if __name__ == "__main__":
                         max_search=args.max_search_per_tree,
                         max_otrc_scores=max_otrc_scores,
                         skip_init_search=skip_init_search,
+                        tree_search_state=tree_search_state,
+                        affected_tree_ids=affected_tree_ids,
                         gamma=args.gamma,
                         tau=args.tau,
                     )
