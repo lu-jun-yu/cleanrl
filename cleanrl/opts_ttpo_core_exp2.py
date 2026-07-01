@@ -97,7 +97,7 @@ def compute_branch_weight(
         for i in is_root.nonzero(as_tuple=True)[0].tolist():
             env_idx = env_indices[i]
             tree_root_id = p_steps[i].item()
-            weights[step, i] = root_branch_counts[env_idx].get(tree_root_id, 1)
+            weights[step, i] = root_branch_counts[env_idx][tree_root_id]
 
         if not is_root.all():
             valid_parents = p_steps[~is_root]

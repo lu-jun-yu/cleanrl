@@ -212,33 +212,24 @@ class MuJoCoStateSnapshotWrapper(gym.Wrapper):
         
         # Save goal for goal-conditioned envs like Reacher-v4
         goal = None
-        try:
-            if hasattr(env, "goal") and env.goal is not None:
-                goal = np.array(env.goal, copy=True)
-        except Exception:
-            goal = None
+        if hasattr(env, "goal") and env.goal is not None:
+            goal = np.array(env.goal, copy=True)
 
         # Save RNG state (important for envs with per-episode random goals)
         rng_state = None
-        try:
-            if hasattr(env, "np_random") and env.np_random is not None:
-                rng_state = env.np_random.bit_generator.state
-        except Exception:
-            rng_state = None
+        if hasattr(env, "np_random") and env.np_random is not None:
+            rng_state = env.np_random.bit_generator.state
         
         # Save environment-specific Python attributes that affect reward/obs
         env_attrs = {}
-        try:
-            for attr_name in ['_last_x_position', '_last_position', '_init_obs']:
-                if hasattr(env, attr_name):
-                    val = getattr(env, attr_name)
-                    if val is not None:
-                        if hasattr(val, 'copy'):
-                            env_attrs[attr_name] = val.copy()
-                        else:
-                            env_attrs[attr_name] = val
-        except Exception:
-            pass
+        for attr_name in ['_last_x_position', '_last_position', '_init_obs']:
+            if hasattr(env, attr_name):
+                val = getattr(env, attr_name)
+                if val is not None:
+                    if hasattr(val, 'copy'):
+                        env_attrs[attr_name] = val.copy()
+                    else:
+                        env_attrs[attr_name] = val
 
         # Save TimeLimit state
         timelimit_steps = None
@@ -308,18 +299,12 @@ class MuJoCoStateSnapshotWrapper(gym.Wrapper):
             if hasattr(data, field):
                 target = getattr(data, field)
                 if target is not None and hasattr(target, '__setitem__'):
-                    try:
-                        target[:] = value
-                    except Exception:
-                        pass
+                    target[:] = value
         
         # Restore goal for goal-conditioned envs like Reacher-v4
         # Must be done BEFORE mj_forward for environments that use goal in observations
-        try:
-            if goal is not None and hasattr(env, "goal"):
-                env.goal = np.array(goal, copy=True)
-        except Exception:
-            pass
+        if goal is not None and hasattr(env, "goal"):
+            env.goal = np.array(goal, copy=True)
         
         # Step 2: Call mj_forward to recompute all derived quantities
         # This ensures site_xpos, xipos, subtree_com, cfrc_int, cfrc_ext, etc. are correct
@@ -335,29 +320,20 @@ class MuJoCoStateSnapshotWrapper(gym.Wrapper):
                 if hasattr(data, field):
                     target = getattr(data, field)
                     if target is not None and hasattr(target, '__setitem__'):
-                        try:
-                            target[:] = value
-                        except Exception:
-                            pass
+                        target[:] = value
         
         # Restore environment-specific Python attributes
-        try:
-            if env_attrs:
-                for attr_name, val in env_attrs.items():
-                    if hasattr(env, attr_name):
-                        if hasattr(val, 'copy'):
-                            setattr(env, attr_name, val.copy())
-                        else:
-                            setattr(env, attr_name, val)
-        except Exception:
-            pass
+        if env_attrs:
+            for attr_name, val in env_attrs.items():
+                if hasattr(env, attr_name):
+                    if hasattr(val, 'copy'):
+                        setattr(env, attr_name, val.copy())
+                    else:
+                        setattr(env, attr_name, val)
 
         # Restore RNG state
-        try:
-            if rng_state is not None and hasattr(self.unwrapped, "np_random") and self.unwrapped.np_random is not None:
-                self.unwrapped.np_random.bit_generator.state = rng_state
-        except Exception:
-            pass
+        if rng_state is not None and hasattr(self.unwrapped, "np_random") and self.unwrapped.np_random is not None:
+            self.unwrapped.np_random.bit_generator.state = rng_state
 
         # Restore TimeLimit state
         if self._timelimit_wrapper is not None and timelimit_steps is not None:
@@ -536,7 +512,7 @@ def compute_branch_weight(
         for i in is_root.nonzero(as_tuple=True)[0].tolist():
             env_idx = env_indices[i]
             tree_root_id = p_steps[i].item()
-            weights[step, i] = root_branch_counts[env_idx].get(tree_root_id, 1)
+            weights[step, i] = root_branch_counts[env_idx][tree_root_id]
         
         if not is_root.all():
             valid_parents = p_steps[~is_root]

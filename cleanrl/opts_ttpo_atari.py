@@ -228,11 +228,8 @@ class AtariStateSnapshotWrapper(gym.Wrapper):
 
         # Save underlying RNG state (NoopResetEnv samples no-op counts from it)
         rng_state = None
-        try:
-            if self.unwrapped.np_random is not None:
-                rng_state = self.unwrapped.np_random.bit_generator.state
-        except Exception:
-            rng_state = None
+        if self.unwrapped.np_random is not None:
+            rng_state = self.unwrapped.np_random.bit_generator.state
 
         return (ale_state, timelimit_steps, record_stats, framestack_state, maxandskip_state, episodiclife_state, rng_state)
 
@@ -290,11 +287,8 @@ class AtariStateSnapshotWrapper(gym.Wrapper):
             self._episodiclife_wrapper.was_real_done = episodiclife_state['was_real_done']
 
         # Restore underlying RNG state
-        try:
-            if rng_state is not None and self.unwrapped.np_random is not None:
-                self.unwrapped.np_random.bit_generator.state = rng_state
-        except Exception:
-            pass
+        if rng_state is not None and self.unwrapped.np_random is not None:
+            self.unwrapped.np_random.bit_generator.state = rng_state
 
 
 def make_env(env_id, idx, capture_video, run_name):
