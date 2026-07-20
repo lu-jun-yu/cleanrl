@@ -168,7 +168,7 @@ def select_next_states(
         for tree_id in all_tree_ids:
             if tree_id not in terminal_estimates[env_idx]:
                 continue
-            if search_count[env_idx][tree_id] >= max_search:
+            if search_count[env_idx].get(tree_id, 0) >= max_search:
                 continue
             registered_envs.append(env_idx)
             registered_tree_ids.append(tree_id)
