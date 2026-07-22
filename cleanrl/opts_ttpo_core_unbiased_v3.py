@@ -400,8 +400,8 @@ def select_next_states(
             if env_rows.numel() == 0:
                 continue
             env_m = found_m[env_rows]
-            max_m = env_m.max()
-            tied_rows = env_rows[env_m == max_m]
+            min_m = env_m.min()
+            tied_rows = env_rows[env_m == min_m]
             chosen_row = tied_rows[
                 torch.randint(tied_rows.numel(), (1,), device=device)
             ].item()
