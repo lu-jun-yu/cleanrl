@@ -73,7 +73,6 @@ class Args:
     """the discount factor gamma"""
     gae_lambda: float = 0.95
     """the lambda for the general advantage estimation"""
-    search_lam: float = 1.0
     """the lambda used by the separate TreeGAE estimator for tree search"""
     num_minibatches: int = 4
     """the number of mini-batches"""
@@ -414,7 +413,7 @@ if __name__ == "__main__":
         if resume_checkpoint is not None and resume_checkpoint.get("run_name")
         else f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     )
-    algorithm_name = f"{args.exp_name}_s{args.max_search_per_tree}_sl{args.search_lam:g}_20260721"
+    algorithm_name = f"{args.exp_name}_s{args.max_search_per_tree}_20260722"
     if args.track:
         import wandb
 
@@ -496,7 +495,7 @@ if __name__ == "__main__":
     else:
         required_match_keys = [
             "env_id", "seed", "num_envs", "num_steps", "num_minibatches",
-            "gamma", "gae_lambda", "search_lam", "max_search_per_tree",
+            "gamma", "gae_lambda", "max_search_per_tree",
         ]
         mismatched = [k for k in required_match_keys if resume_checkpoint["args"].get(k) != getattr(args, k)]
         if mismatched:
@@ -655,7 +654,7 @@ if __name__ == "__main__":
                         parent_indices=parent_indices,
                         advantages=search_advantages,
                         gamma=args.gamma,
-                        gae_lambda=args.search_lam,
+                        gae_lambda=1.0,
                     )
 
                 if step < args.num_steps - 1:
@@ -663,6 +662,7 @@ if __name__ == "__main__":
                     selected = select_next_states(
                         terminated_envs=terminated_envs,
                         current_step=step,
+                        rewards=rewards,
                         search_advantages=search_advantages,
                         values=values,
                         parent_indices=parent_indices,
@@ -675,7 +675,6 @@ if __name__ == "__main__":
                         skip_init_search=skip_init_search,
                         affected_tree_ids=affected_tree_ids,
                         gamma=args.gamma,
-                        search_lam=args.search_lam,
                     )
 
                     # OTRC selection and state restoration

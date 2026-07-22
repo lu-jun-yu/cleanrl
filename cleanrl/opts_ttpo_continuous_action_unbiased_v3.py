@@ -61,7 +61,6 @@ class Args:
     """the discount factor gamma"""
     gae_lambda: float = 0.95
     """the lambda for the general advantage estimation"""
-    search_lam: float = 1.0
     """the lambda used by the separate TreeGAE estimator for tree search"""
     num_minibatches: int = 32
     """the number of mini-batches"""
@@ -423,7 +422,7 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    algorithm_name = f"{args.exp_name}_s{args.max_search_per_tree}_sl{args.search_lam:g}_20260721"
+    algorithm_name = f"{args.exp_name}_s{args.max_search_per_tree}_20260722"
     if args.track:
         import wandb
 
@@ -627,7 +626,7 @@ if __name__ == "__main__":
                         parent_indices=parent_indices,
                         advantages=search_advantages,
                         gamma=args.gamma,
-                        gae_lambda=args.search_lam,
+                        gae_lambda=1.0,
                     )
 
                 if step < args.num_steps - 1:
@@ -635,6 +634,7 @@ if __name__ == "__main__":
                     selected = select_next_states(
                         terminated_envs=terminated_envs,
                         current_step=step,
+                        rewards=rewards,
                         search_advantages=search_advantages,
                         values=values,
                         parent_indices=parent_indices,
@@ -647,7 +647,6 @@ if __name__ == "__main__":
                         skip_init_search=skip_init_search,
                         affected_tree_ids=affected_tree_ids,
                         gamma=args.gamma,
-                        search_lam=args.search_lam,
                     )
 
                     # OTRC selection and state restoration

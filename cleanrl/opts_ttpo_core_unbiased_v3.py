@@ -1,5 +1,5 @@
-# Unbiased OPTS-TTPO V3 core: TreeGAE, branch weights, and value-degradation search.
-# V3 filters trees by root M before traversing for the first degraded state.
+# Unbiased OPTS-TTPO V3 core: TreeGAE, branch weights, and prefix-value search.
+# Search evaluates every tree node from its discounted prefix reward and value.
 from typing import List
 
 import torch
@@ -112,6 +112,7 @@ def compute_branch_weight(
 def select_next_states(
     terminated_envs: list[int],
     current_step: int,
+    rewards: torch.Tensor,
     search_advantages: torch.Tensor,
     values: torch.Tensor,
     parent_indices: torch.Tensor,
@@ -124,18 +125,9 @@ def select_next_states(
     skip_init_search: list[bool],
     affected_tree_ids: list[int],
     gamma: float = 0.99,
-    search_lam: float = 1.0,
 ) -> list[int]:
-    """Select one value-degradation branch point independently for each env."""
+    """Select one prefix-value degradation branch point for each terminated env."""
     n_steps = current_step + 1
-    env_indices = list(range(parent_indices.shape[1]))
-    branch_weights = compute_branch_weight(
-        num_steps=n_steps,
-        parent_indices=parent_indices,
-        state_branches=state_branches,
-        env_indices=env_indices,
-        root_branch_counts=root_branch_counts,
-    )
 
     # Update every newly completed tree before constructing the shared baseline.
     # A tree being expanded keeps its previous cached estimate until this point.
@@ -148,9 +140,7 @@ def select_next_states(
         root_steps = ((trees == tree_id) & (parents < 0)).nonzero(as_tuple=True)[0]
         root_value = values[root_steps, env_idx].mean()
         root_advantage = search_advantages[root_steps, env_idx].mean()
-        terminal_estimates[env_idx][tree_id] = float(
-            (root_value + search_lam * root_advantage).item()
-        )
+        terminal_estimates[env_idx][tree_id] = float((root_value + root_advantage).item())
 
     global_count = sum(len(estimates) for estimates in terminal_estimates)
     global_sum = sum(sum(estimates.values()) for estimates in terminal_estimates)
@@ -159,7 +149,7 @@ def select_next_states(
     registered_tree_ids = []
     registered_baselines = []
 
-    # Registration is cheap metadata work. The depth-wise traversal below is fully batched.
+    # Registration only records searchable complete trees and their leave-one-out baselines.
     for env_idx in terminated_envs:
         all_tree_ids = torch.unique(tree_indices[:n_steps, env_idx]).tolist()
         env_num_trees[env_idx] = len(all_tree_ids)
@@ -186,14 +176,8 @@ def select_next_states(
         env_to_local = {env_idx: e_local for e_local, env_idx in enumerate(terminated_envs)}
         sub_parents = parent_indices[:n_steps, env_arr]
         sub_trees = tree_indices[:n_steps, env_arr]
-        sub_advantages = search_advantages[:n_steps, env_arr]
+        sub_rewards = rewards[:n_steps, env_arr]
         sub_values = values[:n_steps, env_arr]
-        sub_branch_weights = branch_weights[:n_steps, env_arr]
-
-        step_grid = torch.arange(n_steps, device=device).unsqueeze(1).expand(n_steps, num_terminated)
-        env_grid = torch.arange(num_terminated, device=device).unsqueeze(0).expand(n_steps, num_terminated)
-        flat_grid = step_grid * num_terminated + env_grid
-        num_nodes = n_steps * num_terminated
 
         tree_rows = torch.full(
             (n_steps, num_terminated), -1, device=device, dtype=torch.long
@@ -202,194 +186,80 @@ def select_next_states(
             e_local = env_to_local[env_idx]
             tree_rows[:, e_local].masked_fill_(sub_trees[:, e_local] == tree_id, row)
 
-        all_root_mask = (sub_parents < 0) & (tree_rows >= 0)
-        all_root_rows = tree_rows[all_root_mask]
-
-        root_counts = torch.zeros(num_trees, device=device, dtype=dtype)
-        root_values = torch.zeros(num_trees, device=device, dtype=dtype)
-        root_advantages = torch.zeros(num_trees, device=device, dtype=dtype)
-        root_counts.scatter_add_(
-            0, all_root_rows, torch.ones_like(all_root_rows, dtype=dtype)
-        )
-        root_values.scatter_add_(0, all_root_rows, sub_values[all_root_mask])
-        root_advantages.scatter_add_(
-            0, all_root_rows, sub_advantages[all_root_mask]
-        )
-        root_values /= root_counts
-        root_advantages /= root_counts
-
-        baselines = torch.tensor(registered_baselines, device=device, dtype=dtype)
-        eligible_trees = root_values >= baselines
-        valid_tree_nodes = tree_rows >= 0
-        tree_rows[valid_tree_nodes & ~eligible_trees[tree_rows.clamp_min(0)]] = -1
-        flat_rows = tree_rows.reshape(-1)
-        root_mask = (sub_parents < 0) & (tree_rows >= 0)
-        root_flat = flat_grid[root_mask]
-        root_rows = tree_rows[root_mask]
-
-        # Pick an arbitrary root edge for restoring the root state; exact ties are randomized.
-        root_priority = torch.rand(root_flat.numel(), device=device, dtype=dtype)
-        root_priority_max = torch.full((num_trees,), -1.0, device=device, dtype=dtype)
-        root_priority_max.scatter_reduce_(
-            0, root_rows, root_priority, reduce="amax", include_self=True
-        )
-        chosen_root = root_priority == root_priority_max[root_rows]
-        root_positions = torch.full((num_trees,), -1, device=device, dtype=torch.long)
-        root_positions.scatter_reduce_(
-            0, root_rows[chosen_root], root_flat[chosen_root], reduce="amin", include_self=False
-        )
-
-        # Edge depth is computed once for every environment in parallel.
-        edge_depths = torch.ones_like(sub_parents)
+        # Every row represents the state before that row's action. For a child
+        # row x, its fixed prefix includes the reward of every ancestor action.
+        node_depths = torch.zeros_like(sub_parents)
+        prefix_returns = torch.zeros_like(sub_values)
         local_envs = torch.arange(num_terminated, device=device)
+        gamma_t = torch.as_tensor(gamma, device=device, dtype=dtype)
         for step in range(n_steps):
             parents_at_step = sub_parents[step]
             non_root = parents_at_step >= 0
             safe_parents = parents_at_step.clamp_min(0)
-            parent_depth = edge_depths[safe_parents, local_envs]
-            edge_depths[step] = torch.where(non_root, parent_depth + 1, 1)
+            parent_depths = node_depths[safe_parents, local_envs]
+            parent_prefixes = prefix_returns[safe_parents, local_envs]
+            parent_rewards = sub_rewards[safe_parents, local_envs]
+            node_depths[step] = torch.where(non_root, parent_depths + 1, 0)
+            prefix_returns[step] = torch.where(
+                non_root,
+                parent_prefixes
+                + torch.pow(gamma_t, parent_depths.to(dtype)) * parent_rewards,
+                0.0,
+            )
 
-        # Aggregate outgoing edge advantages at every non-terminal successor state.
-        is_child_edge = (sub_parents >= 0) & (tree_rows >= 0)
-        child_flat = flat_grid[is_child_edge]
-        parent_flat = (sub_parents * num_terminated + env_grid)[is_child_edge]
-        flat_advantages = sub_advantages.reshape(-1)
-        node_advantage_sums = torch.zeros(num_nodes, device=device, dtype=dtype)
-        node_outdegrees = torch.zeros(num_nodes, device=device, dtype=dtype)
-        node_advantage_sums.scatter_add_(0, parent_flat, flat_advantages[child_flat])
-        node_outdegrees.scatter_add_(
-            0, parent_flat, torch.ones_like(parent_flat, dtype=dtype)
-        )
-        has_outgoing = node_outdegrees > 0
-        node_advantages = node_advantage_sums / node_outdegrees.clamp_min(1.0)
+        node_m = prefix_returns + torch.pow(
+            gamma_t, node_depths.to(dtype)
+        ) * sub_values
+        flat_rows = tree_rows.reshape(-1)
+        baselines = torch.tensor(registered_baselines, device=device, dtype=dtype)
+        flat_m = node_m.reshape(-1)
+        flat_depths = node_depths.reshape(-1)
+        valid_nodes = flat_rows >= 0
+        safe_rows = flat_rows.clamp_min(0)
+        candidate_mask = valid_nodes & (flat_m < baselines[safe_rows])
+        candidate_flat = candidate_mask.nonzero(as_tuple=True)[0]
+        candidate_rows = flat_rows[candidate_flat]
+        candidate_depths = flat_depths[candidate_flat]
+        candidate_m = flat_m[candidate_flat]
 
-        # Any outgoing edge represents the same branch state; choose one randomly for restore.
-        state_priority = torch.rand(child_flat.numel(), device=device, dtype=dtype)
-        state_priority_max = torch.full((num_nodes,), -1.0, device=device, dtype=dtype)
-        state_priority_max.scatter_reduce_(
-            0, parent_flat, state_priority, reduce="amax", include_self=True
+        min_depths = torch.full(
+            (num_trees,), n_steps + 1, device=device, dtype=torch.long
         )
-        chosen_state_edge = state_priority == state_priority_max[parent_flat]
-        state_positions = torch.full((num_nodes,), -1, device=device, dtype=torch.long)
-        state_positions.scatter_reduce_(
-            0,
-            parent_flat[chosen_state_edge],
-            child_flat[chosen_state_edge],
-            reduce="amin",
-            include_self=False,
+        min_depths.scatter_reduce_(
+            0, candidate_rows, candidate_depths, reduce="amin", include_self=True
         )
+        at_min_depth = candidate_depths == min_depths[candidate_rows]
+        depth_rows = candidate_rows[at_min_depth]
+        depth_flat = candidate_flat[at_min_depth]
+        depth_m = candidate_m[at_min_depth]
 
-        # M for the state reached after each edge. Invalid/terminal states remain -inf.
-        successor_m = torch.full((num_nodes,), float("-inf"), device=device, dtype=dtype)
-        valid_successor = has_outgoing & (flat_rows >= 0)
-        valid_flat = valid_successor.nonzero(as_tuple=True)[0]
-        valid_rows = flat_rows[valid_flat]
-        flat_depths = edge_depths.reshape(-1)
-        flat_weights = sub_branch_weights.reshape(-1)
-        discounts = (gamma * search_lam) ** flat_depths[valid_flat].to(dtype)
-        successor_m[valid_flat] = root_values[valid_rows] + search_lam * (
-            root_advantages[valid_rows]
-            - discounts * node_advantages[valid_flat] / flat_weights[valid_flat]
+        tree_candidate_m = torch.full(
+            (num_trees,), float("-inf"), device=device, dtype=dtype
         )
+        tree_candidate_m.scatter_reduce_(
+            0, depth_rows, depth_m, reduce="amax", include_self=True
+        )
+        max_at_depth = depth_m == tree_candidate_m[depth_rows]
+        tied_rows = depth_rows[max_at_depth]
+        tied_flat = depth_flat[max_at_depth]
 
-        # Select the maximum-M successor for every non-root state in one grouped reduction.
-        candidate_child_mask = valid_successor.reshape(n_steps, num_terminated) & (
-            sub_parents >= 0
+        priorities = torch.rand(tied_flat.numel(), device=device, dtype=dtype)
+        priority_max = torch.full((num_trees,), -1.0, device=device, dtype=dtype)
+        priority_max.scatter_reduce_(
+            0, tied_rows, priorities, reduce="amax", include_self=True
         )
-        candidate_child_flat = flat_grid[candidate_child_mask]
-        candidate_parent_flat = (
-            sub_parents * num_terminated + env_grid
-        )[candidate_child_mask]
-        candidate_child_m = successor_m[candidate_child_flat]
-        parent_max_m = torch.full((num_nodes,), float("-inf"), device=device, dtype=dtype)
-        parent_max_m.scatter_reduce_(
-            0, candidate_parent_flat, candidate_child_m, reduce="amax", include_self=True
-        )
-        max_child = candidate_child_m == parent_max_m[candidate_parent_flat]
-        child_priority = torch.rand(candidate_child_flat.numel(), device=device, dtype=dtype)
-        child_priority = child_priority.masked_fill(~max_child, -1.0)
-        child_priority_max = torch.full((num_nodes,), -1.0, device=device, dtype=dtype)
-        child_priority_max.scatter_reduce_(
-            0, candidate_parent_flat, child_priority, reduce="amax", include_self=True
-        )
-        chosen_child = max_child & (
-            child_priority == child_priority_max[candidate_parent_flat]
-        )
-        best_child = torch.full((num_nodes,), -1, device=device, dtype=torch.long)
-        best_child.scatter_reduce_(
-            0,
-            candidate_parent_flat[chosen_child],
-            candidate_child_flat[chosen_child],
-            reduce="amin",
-            include_self=False,
-        )
-
-        # Root states use tree row as their grouping key instead of a parent flat ID.
-        root_successor_mask = root_mask.reshape(-1) & valid_successor
-        root_successor_flat = root_successor_mask.nonzero(as_tuple=True)[0]
-        root_successor_rows = flat_rows[root_successor_flat]
-        root_successor_m = successor_m[root_successor_flat]
-        root_max_m = torch.full((num_trees,), float("-inf"), device=device, dtype=dtype)
-        root_max_m.scatter_reduce_(
-            0, root_successor_rows, root_successor_m, reduce="amax", include_self=True
-        )
-        max_root_child = root_successor_m == root_max_m[root_successor_rows]
-        root_child_priority = torch.rand(root_successor_flat.numel(), device=device, dtype=dtype)
-        root_child_priority = root_child_priority.masked_fill(~max_root_child, -1.0)
-        root_child_priority_max = torch.full(
-            (num_trees,), -1.0, device=device, dtype=dtype
-        )
-        root_child_priority_max.scatter_reduce_(
-            0,
-            root_successor_rows,
-            root_child_priority,
-            reduce="amax",
-            include_self=True,
-        )
-        chosen_root_child = max_root_child & (
-            root_child_priority == root_child_priority_max[root_successor_rows]
-        )
-        best_root_child = torch.full(
+        chosen = priorities == priority_max[tied_rows]
+        tree_positions = torch.full(
             (num_trees,), -1, device=device, dtype=torch.long
         )
-        best_root_child.scatter_reduce_(
+        tree_positions.scatter_reduce_(
             0,
-            root_successor_rows[chosen_root_child],
-            root_successor_flat[chosen_root_child],
+            tied_rows[chosen],
+            tied_flat[chosen],
             reduce="amin",
             include_self=False,
         )
-
-        # All trees now move from root to leaf together; no per-tree path loop remains.
-        current_m = root_values.clone()
-        current_positions = root_positions.clone()
-        current_depths = torch.zeros(num_trees, device=device, dtype=torch.long)
-        next_nodes = best_root_child.clone()
-        active = eligible_trees.clone()
-        found = torch.zeros(num_trees, device=device, dtype=torch.bool)
-        found_m = torch.zeros(num_trees, device=device, dtype=dtype)
-        found_positions = torch.full((num_trees,), -1, device=device, dtype=torch.long)
-        found_depths = torch.zeros(num_trees, device=device, dtype=torch.long)
-
-        while bool(active.any()):
-            degraded = active & (current_m < baselines)
-            found[degraded] = True
-            found_m[degraded] = current_m[degraded]
-            found_positions[degraded] = current_positions[degraded]
-            found_depths[degraded] = current_depths[degraded]
-            active &= ~degraded
-
-            can_advance = active & (next_nodes >= 0)
-            active &= can_advance
-            if not bool(active.any()):
-                break
-
-            rows = active.nonzero(as_tuple=True)[0]
-            incoming = next_nodes[rows]
-            current_m[rows] = successor_m[incoming]
-            current_positions[rows] = state_positions[incoming]
-            current_depths[rows] += 1
-            next_nodes[rows] = best_child[incoming]
+        found = tree_positions >= 0
 
         registered_envs_t = torch.tensor(registered_envs, device=device, dtype=torch.long)
         registered_tree_ids_t = torch.tensor(
@@ -399,22 +269,22 @@ def select_next_states(
             env_rows = ((registered_envs_t == env_idx) & found).nonzero(as_tuple=True)[0]
             if env_rows.numel() == 0:
                 continue
-            env_m = found_m[env_rows]
-            min_m = env_m.min()
-            tied_rows = env_rows[env_m == min_m]
+            env_m = tree_candidate_m[env_rows]
+            max_m = env_m.max()
+            tied_rows = env_rows[env_m == max_m]
             chosen_row = tied_rows[
                 torch.randint(tied_rows.numel(), (1,), device=device)
             ].item()
             tree_id = int(registered_tree_ids_t[chosen_row].item())
             search_count[env_idx][tree_id] = search_count[env_idx].get(tree_id, 0) + 1
             selected_by_env[env_idx] = int(
-                (found_positions[chosen_row] // num_terminated).item()
+                (tree_positions[chosen_row] // num_terminated).item()
             )
             print(
                 f"    Tree Search: env_idx={env_idx}, tree_id={tree_id}, "
-                f"M={found_m[chosen_row].item():.4f}, "
+                f"M={tree_candidate_m[chosen_row].item():.4f}, "
                 f"search_count={search_count[env_idx][tree_id]}, "
-                f"depth={found_depths[chosen_row].item()}"
+                f"depth={min_depths[chosen_row].item()}"
             )
 
     selected = []
