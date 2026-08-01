@@ -1,4 +1,4 @@
-# OPTS-TTPO exp3 core: max-backup TreeGAE, branch weights, and parallel tree-search node selection.
+# OPTS-TTPO exp3 core: leaf-weighted TreeGAE, branch weights, and parallel tree-search node selection.
 from typing import List
 
 import numpy as np
@@ -19,6 +19,8 @@ def compute_tree_gae(
 ):
     """
     Compute TreeGAE advantages from terminal node back to root.
+    At a branch, each child advantage is weighted by the number of leaves in
+    that child's subtree.
     Synchronizes advantages for identical state-action pairs.
 
     Args:
@@ -29,6 +31,16 @@ def compute_tree_gae(
         gamma, gae_lambda: GAE parameters
         next_value: Bootstrap value for non-terminal leaf nodes
     """
+    prefix_parents = parent_indices[: terminal_step + 1, env_idx].tolist()
+    parent_nodes = {parent for parent in prefix_parents if parent >= 0}
+    leaf_counts = [0] * (terminal_step + 1)
+    for node in range(terminal_step, -1, -1):
+        if node not in parent_nodes:
+            leaf_counts[node] = 1
+        parent = prefix_parents[node]
+        if parent >= 0:
+            leaf_counts[parent] += leaf_counts[node]
+
     current = terminal_step
 
     while True:
@@ -50,8 +62,9 @@ def compute_tree_gae(
         else:
             # Branch node
             child_advs = torch.stack([advantages[child, env_idx] for child in children])
-            max_child_adv = child_advs.max()
-            advantages[current, env_idx] = delta + gamma * gae_lambda * max_child_adv
+            child_leaf_counts = child_advs.new_tensor([leaf_counts[child] for child in children])
+            weighted_child_adv = (child_advs * child_leaf_counts).sum() / child_leaf_counts.sum()
+            advantages[current, env_idx] = delta + gamma * gae_lambda * weighted_child_adv
 
         # Move to parent (parent < 0 means root node)
         parent = parent_indices[current, env_idx].item()
