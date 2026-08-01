@@ -16,7 +16,7 @@ import tyro
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
-from opts_ttpo_core_exp3 import compute_branch_weight, compute_tree_gae, select_next_states
+from opts_ttpo_core_exp3 import compute_branch_weight, compute_equal_branch_weight, compute_tree_gae, select_next_states
 
 
 @dataclass
@@ -479,7 +479,6 @@ if __name__ == "__main__":
     parent_indices = -torch.ones((args.num_steps, args.num_envs), dtype=torch.long).to(device)
     # OPTS_TTPO: Tree id per node (used when nodes from the same tree are not contiguous)
     tree_indices = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long).to(device)
-    state_branches = torch.ones((args.num_steps, args.num_envs), dtype=torch.long).to(device)
     advantages = torch.zeros((args.num_steps, args.num_envs)).to(device)
     returns = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
@@ -507,9 +506,6 @@ if __name__ == "__main__":
     for iteration in range(1, args.num_iterations + 1):
         episodic_return_info = []  # (episodic_return, tid, step, env_idx)
 
-        # OPTS_TTPO: root_branch_counts maintained incrementally
-        root_branch_counts = [defaultdict(int) for _ in range(args.num_envs)]
-
         # search count per tree (reset each iteration)
         search_count = [{} for _ in range(args.num_envs)]
 
@@ -536,7 +532,6 @@ if __name__ == "__main__":
         next_done.zero_()
 
         current_parent = [-1] * args.num_envs
-        state_branches.fill_(1)
         advantages.zero_()
         parent_indices.fill_(-1)
         tree_indices.zero_()
@@ -560,15 +555,11 @@ if __name__ == "__main__":
             rewards_list = []
             next_done_list = []
 
-            # Save parent_indices and update root_branch_counts
+            # Save tree parent and root identifiers.
             for env_idx in range(args.num_envs):
                 p = current_parent[env_idx]
                 parent_indices[step, env_idx] = p
                 tree_indices[step, env_idx] = p if p < 0 else tree_indices[p, env_idx]
-                
-                # Update root_branch_counts if this is a root node
-                if p < 0:
-                    root_branch_counts[env_idx][p] += 1
 
                 current_parent[env_idx] = step
 
@@ -651,7 +642,6 @@ if __name__ == "__main__":
                                 envs[env_idx].restore_state(root_states[env_idx][parent])
                             else:
                                 envs[env_idx].restore_state(env_states[parent][env_idx])
-                                state_branches[parent, env_idx] += 1
                             next_obs[env_idx] = obs[selected[i], env_idx]
                             current_parent[env_idx] = parent
 
@@ -678,17 +668,20 @@ if __name__ == "__main__":
         # Compute returns: returns[t] = A(s_t, a_t) + V(s_t)
         returns = advantages + values
 
-        # Compute branch_weight for all environments
+        # Compute direct branch weights for all environments
         branch_weights = compute_branch_weight(
             num_steps=args.num_steps,
             parent_indices=parent_indices,
-            state_branches=state_branches,
             env_indices=list(range(args.num_envs)),
-            root_branch_counts=root_branch_counts,
         )
 
         # Compute tree-weighted aggregated returns
         if episodic_return_info:
+            return_branch_weights = compute_equal_branch_weight(
+                num_steps=args.num_steps,
+                parent_indices=parent_indices,
+                env_indices=list(range(args.num_envs)),
+            )
             tid_groups = defaultdict(list)  # (env_idx, tid) -> [(return, step)]
             for ep_return, tid, ep_step, ei in episodic_return_info:
                 tid_groups[(ei, tid)].append((ep_return, ep_step))
@@ -698,9 +691,9 @@ if __name__ == "__main__":
                 weighted_sum = 0.0
                 weight_sum = 0.0
                 for ep_return, ep_step in entries:
-                    w = branch_weights[ep_step, ei].item()
-                    weighted_sum += ep_return / w
-                    weight_sum += 1.0 / w
+                    w = return_branch_weights[ep_step, ei].item()
+                    weighted_sum += ep_return * w
+                    weight_sum += w
                 aggregated_returns.append(weighted_sum / weight_sum if weight_sum > 0 else 0.0)
 
             mean_return = sum(aggregated_returns) / len(aggregated_returns)
@@ -742,11 +735,12 @@ if __name__ == "__main__":
         b_weights = branch_weights.reshape(-1)
 
         # OPTS_TTPO: constant loss normalizer + full-batch weighted advantage normalization
-        b_w = 1.0 / b_weights
-        loss_norm = b_w.sum() / args.num_minibatches
+        loss_norm = b_weights.sum() / args.num_minibatches
         if args.norm_adv:
-            adv_mean = (b_advantages * b_w).sum() / b_w.sum()
-            adv_var = ((b_advantages - adv_mean) ** 2 * b_w).sum() / (b_w.sum() - (b_w**2).sum() / b_w.sum())
+            adv_mean = (b_advantages * b_weights).sum() / b_weights.sum()
+            adv_var = ((b_advantages - adv_mean) ** 2 * b_weights).sum() / (
+                b_weights.sum() - (b_weights**2).sum() / b_weights.sum()
+            )
             b_advantages = (b_advantages - adv_mean) / (torch.sqrt(adv_var) + 1e-8)
 
         # Optimizing the policy and value network
@@ -769,15 +763,15 @@ if __name__ == "__main__":
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
                 mb_advantages = b_advantages[mb_inds]
-                w = b_w[mb_inds]
+                w = b_weights[mb_inds]
 
-                # Policy loss (weighted by branch factors)
+                # Policy loss (weighted by branch weights)
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss_per_sample = torch.max(pg_loss1, pg_loss2)
                 pg_loss = wagg(pg_loss_per_sample)
 
-                # Value loss (weighted by branch factors)
+                # Value loss (weighted by branch weights)
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
                     v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
