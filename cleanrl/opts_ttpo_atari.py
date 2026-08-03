@@ -769,9 +769,8 @@ if __name__ == "__main__":
         b_values = values.reshape(-1)
         b_weights = branch_weights.reshape(-1)
 
-        # OPTS_TTPO: constant loss normalizer + full-batch weighted advantage normalization
+        # OPTS_TTPO: full-batch weighted advantage normalization
         b_w = 1.0 / b_weights
-        loss_norm = b_w.sum() / args.num_minibatches
         if args.norm_adv:
             adv_mean = (b_advantages * b_w).sum() / b_w.sum()
             adv_var = ((b_advantages - adv_mean) ** 2 * b_w).sum() / (b_w.sum() - (b_w**2).sum() / b_w.sum())
@@ -785,6 +784,7 @@ if __name__ == "__main__":
             for start in range(0, args.batch_size, args.minibatch_size):
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
+                loss_norm = len(mb_inds)
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
