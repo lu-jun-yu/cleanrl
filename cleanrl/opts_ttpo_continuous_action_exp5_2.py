@@ -16,7 +16,7 @@ import tyro
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
-from opts_ttpo_core_exp5 import compute_branch_weight, compute_tree_gae, select_next_states
+from opts_ttpo_core_exp5_2 import compute_branch_weight, compute_tree_gae, select_next_states
 
 
 @dataclass
@@ -734,8 +734,7 @@ if __name__ == "__main__":
         b_values = values.reshape(-1)
         b_weights = branch_weights.reshape(-1)
 
-        # OPTS_TTPO: constant loss normalizer + full-batch weighted advantage normalization
-        loss_norm = b_weights.sum() / args.num_minibatches
+        # OPTS_TTPO: full-batch weighted advantage normalization
         if args.norm_adv:
             adv_mean = (b_advantages * b_weights).sum() / b_weights.sum()
             adv_var = ((b_advantages - adv_mean) ** 2 * b_weights).sum() / (
@@ -751,6 +750,7 @@ if __name__ == "__main__":
             for start in range(0, args.batch_size, args.minibatch_size):
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
+                loss_norm = len(mb_inds)
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]

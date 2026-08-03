@@ -1,4 +1,4 @@
-# OPTS-TTPO exp5 core: max-backup TreeGAE, equal branch weights, and parallel tree-search node selection.
+# OPTS-TTPO exp5_2 core: max-backup TreeGAE, equal branch weights, and parallel tree-search node selection.
 from typing import List
 
 import numpy as np
