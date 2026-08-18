@@ -16,7 +16,7 @@ import tyro
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
-from opts_ttpo_core_exp8_4 import compute_branch_weight, compute_tree_gae, select_next_states
+from opts_ttpo_core_wEqual_bMax import compute_branch_weight, compute_tree_gae, select_next_states
 
 
 @dataclass
@@ -84,8 +84,6 @@ class Args:
     """tau for the OTRC node selection"""
     max_search_per_tree: int = 1
     """maximum number of tree searches per environment per iteration"""
-    max_searched_tree_ratio: float = 0.5
-    """maximum fraction of completed trees searched at least once"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -425,10 +423,7 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    algorithm_name = (
-        f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_"
-        f"sr{args.max_searched_tree_ratio}_mean_20260813"
-    )
+    algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260817"
     if args.track:
         import wandb
 
@@ -514,6 +509,7 @@ if __name__ == "__main__":
         # search count per tree (reset each iteration)
         search_count = [{} for _ in range(args.num_envs)]
 
+        # pooled mean-otrc_score stats for tree filtering (verify_scaling_variance v2)
         max_otrc_scores = [{} for _ in range(args.num_envs)]
         tree_search_state = [{} for _ in range(args.num_envs)]
 
@@ -623,7 +619,6 @@ if __name__ == "__main__":
                         tree_indices=tree_indices,
                         search_count=search_count,
                         max_search=args.max_search_per_tree,
-                        max_searched_tree_ratio=args.max_searched_tree_ratio,
                         max_otrc_scores=max_otrc_scores,
                         skip_init_search=skip_init_search,
                         tree_search_state=tree_search_state,
@@ -712,7 +707,7 @@ if __name__ == "__main__":
         print(f"Iteration {iteration}: mean_return={mean_return:.4f}, max_return={max_return:.4f}, min_return={min_return:.4f}")
 
         # Save results to JSON file
-        folder_name = f"./results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
+        folder_name = f"/data/results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
         os.makedirs(folder_name, exist_ok=True)
         safe_env_id = args.env_id.replace("/", "_")
         result_filename = f"{folder_name}/{safe_env_id}_{args.seed}.json"
@@ -738,6 +733,7 @@ if __name__ == "__main__":
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
         b_weights = branch_weights.reshape(-1)
+        b_weights = torch.ones_like(b_weights)  # wNone: weights excluded from gradient, kept for return aggregation
 
         # OPTS_TTPO: full-batch weighted advantage normalization
         if args.norm_adv:

@@ -243,7 +243,7 @@ if __name__ == "__main__":
         min_return = min(episodic_returns) if episodic_returns else 0.0
         print(f"Iteration {iteration}: mean_return={mean_return:.4f}, max_return={max_return:.4f}, min_return={min_return:.4f}")
 
-        folder_name = f"./results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
+        folder_name = f"/data/results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
         os.makedirs(folder_name, exist_ok=True)
         safe_env_id = args.env_id.replace("/", "_")
         result_filename = f"{folder_name}/{safe_env_id}_{args.seed}.json"

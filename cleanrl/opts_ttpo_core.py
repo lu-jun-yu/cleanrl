@@ -1,4 +1,4 @@
-# OPTS-TTPO core: TreeGAE advantage, branch weights, and parallel tree-search node selection.
+# OPTS-TTPO core: max-backup TreeGAE, equal branch weights, and parallel tree-search node selection.
 # Shared by opts_ttpo_atari.py and opts_ttpo_continuous_action.py.
 from typing import List
 
@@ -20,6 +20,7 @@ def compute_tree_gae(
 ):
     """
     Compute TreeGAE advantages from terminal node back to root.
+    At a branch, the maximum child advantage is propagated backward.
     Synchronizes advantages for identical state-action pairs.
 
     Args:
@@ -51,8 +52,8 @@ def compute_tree_gae(
         else:
             # Branch node
             child_advs = torch.stack([advantages[child, env_idx] for child in children])
-            mean_child_adv = child_advs.mean()
-            advantages[current, env_idx] = delta + gamma * gae_lambda * mean_child_adv
+            max_child_adv = child_advs.max()
+            advantages[current, env_idx] = delta + gamma * gae_lambda * max_child_adv
 
         # Move to parent (parent < 0 means root node)
         parent = parent_indices[current, env_idx].item()
@@ -64,48 +65,30 @@ def compute_tree_gae(
 def compute_branch_weight(
     num_steps: int,
     parent_indices: torch.Tensor,
-    state_branches: torch.Tensor,
     env_indices: List[int],
-    root_branch_counts: List[dict],
 ) -> torch.Tensor:
-    """
-    Compute branch weight factors for specified environments.
-    W_t = W_parent * state_branches[parent]
-
-    For root nodes (parent < 0), the initial weight is the number of branches
-    originating from the same root state (from root_branch_counts).
-
-    Args:
-        num_steps: Number of steps collected
-        parent_indices: Parent indices tensor (num_steps, num_envs)
-        state_branches: State branches tensor (num_steps, num_envs)
-        env_indices: List of environment indices to compute weights for
-        root_branch_counts: List of dicts mapping root_id -> branch_count for each env
-
-    Returns:
-        weights: (num_steps, len(env_indices)) tensor of branch weight factors
-    """
+    """Compute direct weights by splitting equally at every branch."""
     device = parent_indices.device
-    n_envs = len(env_indices)
-    env_t = torch.tensor(env_indices, device=device, dtype=torch.long)
+    weights = torch.empty((num_steps, len(env_indices)), device=device, dtype=torch.float32)
 
-    weights = torch.ones((num_steps, n_envs), device=device, dtype=torch.float32)
-    for step in range(num_steps):
-        p_steps = parent_indices[step, env_t]
-        is_root = p_steps < 0
+    for output_env_idx, env_idx in enumerate(env_indices):
+        parents = parent_indices[:num_steps, env_idx].tolist()
+        child_counts = [0] * num_steps
+        root_counts = {}
+        for parent in parents:
+            if parent < 0:
+                root_counts[parent] = root_counts.get(parent, 0) + 1
+            else:
+                child_counts[parent] += 1
 
-        for i in is_root.nonzero(as_tuple=True)[0].tolist():
-            env_idx = env_indices[i]
-            tree_root_id = p_steps[i].item()
-            weights[step, i] = root_branch_counts[env_idx][tree_root_id]
+        env_weights = [0.0] * num_steps
+        for node, parent in enumerate(parents):
+            if parent < 0:
+                env_weights[node] = 1.0 / root_counts[parent]
+            else:
+                env_weights[node] = env_weights[parent] / child_counts[parent]
 
-        if not is_root.all():
-            valid_parents = p_steps[~is_root]
-            valid_env_t = env_t[~is_root]
-            valid_indices = torch.arange(n_envs, device=device)[~is_root]
-            p_weights = weights[valid_parents, valid_indices]
-            p_branches = state_branches[valid_parents, valid_env_t]
-            weights[step, ~is_root] = p_weights * p_branches
+        weights[:, output_env_idx] = torch.tensor(env_weights, device=device, dtype=torch.float32)
 
     return weights
 
@@ -167,7 +150,7 @@ def select_next_states(
         all_tree_ids = torch.unique(col_trees).tolist()
         searchable_tids = [
             tid for tid in all_tree_ids
-            if not ((skip_init_search[env_idx] and tid == -1) or search_count[env_idx].get(tid, 0) >= max_search)
+            if not (skip_init_search[env_idx] and tid == -1)
         ]
         env_tree_ids_by_local.append(searchable_tids)
         env_num_trees[e_local] = len(all_tree_ids)
@@ -233,6 +216,8 @@ def select_next_states(
     for e_local, env_idx in enumerate(terminated_envs):
         candidates = []
         for tid in env_tree_ids_by_local[e_local]:
+            if search_count[env_idx].get(tid, 0) >= max_search:
+                continue
             state = tree_search_state[env_idx][tid]
             if state["score"] <= mean_threshold:
                 continue

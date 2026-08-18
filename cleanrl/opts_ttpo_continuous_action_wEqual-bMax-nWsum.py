@@ -16,7 +16,7 @@ import tyro
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
-from opts_ttpo_core_exp8_3 import compute_branch_weight, compute_tree_gae, select_next_states
+from opts_ttpo_core_wEqual_bMax import compute_branch_weight, compute_tree_gae, select_next_states
 
 
 @dataclass
@@ -84,8 +84,6 @@ class Args:
     """tau for the OTRC node selection"""
     max_search_per_tree: int = 1
     """maximum number of tree searches per environment per iteration"""
-    max_searched_tree_ratio: float = 0.5
-    """maximum fraction of completed trees searched at least once"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -425,10 +423,7 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    algorithm_name = (
-        f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_"
-        f"sr{args.max_searched_tree_ratio}_20260811"
-    )
+    algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260802"
     if args.track:
         import wandb
 
@@ -514,6 +509,8 @@ if __name__ == "__main__":
         # search count per tree (reset each iteration)
         search_count = [{} for _ in range(args.num_envs)]
 
+        # pooled mean-otrc_score stats for tree filtering (verify_scaling_variance v2)
+        max_otrc_scores = [{} for _ in range(args.num_envs)]
         tree_search_state = [{} for _ in range(args.num_envs)]
 
         # Annealing the rate if instructed to do so.
@@ -622,7 +619,7 @@ if __name__ == "__main__":
                         tree_indices=tree_indices,
                         search_count=search_count,
                         max_search=args.max_search_per_tree,
-                        max_searched_tree_ratio=args.max_searched_tree_ratio,
+                        max_otrc_scores=max_otrc_scores,
                         skip_init_search=skip_init_search,
                         tree_search_state=tree_search_state,
                         affected_tree_ids=affected_tree_ids,
@@ -710,7 +707,7 @@ if __name__ == "__main__":
         print(f"Iteration {iteration}: mean_return={mean_return:.4f}, max_return={max_return:.4f}, min_return={min_return:.4f}")
 
         # Save results to JSON file
-        folder_name = f"./results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
+        folder_name = f"/data/results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
         os.makedirs(folder_name, exist_ok=True)
         safe_env_id = args.env_id.replace("/", "_")
         result_filename = f"{folder_name}/{safe_env_id}_{args.seed}.json"
@@ -737,7 +734,8 @@ if __name__ == "__main__":
         b_values = values.reshape(-1)
         b_weights = branch_weights.reshape(-1)
 
-        # OPTS_TTPO: full-batch weighted advantage normalization
+        # OPTS_TTPO: constant loss normalizer + full-batch weighted advantage normalization
+        loss_norm = b_weights.sum() / args.num_minibatches
         if args.norm_adv:
             adv_mean = (b_advantages * b_weights).sum() / b_weights.sum()
             adv_var = ((b_advantages - adv_mean) ** 2 * b_weights).sum() / (
@@ -753,7 +751,6 @@ if __name__ == "__main__":
             for start in range(0, args.batch_size, args.minibatch_size):
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
-                loss_norm = len(mb_inds)
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]

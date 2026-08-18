@@ -1,4 +1,4 @@
-# OPTS-TTPO exp5_2 core: max-backup TreeGAE, equal branch weights, and parallel tree-search node selection.
+# OPTS-TTPO core (wLeaf-bMean): mean-backup TreeGAE, leaf-count branch weights, and parallel tree-search node selection.
 from typing import List
 
 import numpy as np
@@ -19,7 +19,7 @@ def compute_tree_gae(
 ):
     """
     Compute TreeGAE advantages from terminal node back to root.
-    At a branch, the maximum child advantage is propagated backward.
+    At a branch, the arithmetic mean child advantage is propagated backward.
     Synchronizes advantages for identical state-action pairs.
 
     Args:
@@ -51,8 +51,8 @@ def compute_tree_gae(
         else:
             # Branch node
             child_advs = torch.stack([advantages[child, env_idx] for child in children])
-            max_child_adv = child_advs.max()
-            advantages[current, env_idx] = delta + gamma * gae_lambda * max_child_adv
+            mean_child_adv = child_advs.mean()
+            advantages[current, env_idx] = delta + gamma * gae_lambda * mean_child_adv
 
         # Move to parent (parent < 0 means root node)
         parent = parent_indices[current, env_idx].item()
@@ -66,7 +66,56 @@ def compute_branch_weight(
     parent_indices: torch.Tensor,
     env_indices: List[int],
 ) -> torch.Tensor:
-    """Compute direct weights by splitting equally at every branch."""
+    """
+    Compute the direct training weight for every tree node.
+    A node's weight is its subtree leaf count divided by its tree's leaf count.
+
+    Args:
+        num_steps: Number of steps collected
+        parent_indices: Parent indices tensor (num_steps, num_envs)
+        env_indices: List of environment indices to compute weights for
+
+    Returns:
+        weights: (num_steps, len(env_indices)) tensor of direct branch weights
+    """
+    device = parent_indices.device
+    n_envs = len(env_indices)
+    weights = torch.empty((num_steps, n_envs), device=device, dtype=torch.float32)
+
+    for output_env_idx, env_idx in enumerate(env_indices):
+        parents = parent_indices[:num_steps, env_idx].tolist()
+        parent_nodes = {parent for parent in parents if parent >= 0}
+        leaf_counts = [0] * num_steps
+        for node in range(num_steps - 1, -1, -1):
+            if node not in parent_nodes:
+                leaf_counts[node] = 1
+            parent = parents[node]
+            if parent >= 0:
+                leaf_counts[parent] += leaf_counts[node]
+
+        tree_ids = [0] * num_steps
+        tree_leaf_counts = {}
+        for node, parent in enumerate(parents):
+            tree_id = parent if parent < 0 else tree_ids[parent]
+            tree_ids[node] = tree_id
+            if parent < 0:
+                tree_leaf_counts[tree_id] = tree_leaf_counts.get(tree_id, 0) + leaf_counts[node]
+
+        weights[:, output_env_idx] = torch.tensor(
+            [leaf_counts[node] / tree_leaf_counts[tree_ids[node]] for node in range(num_steps)],
+            device=device,
+            dtype=torch.float32,
+        )
+
+    return weights
+
+
+def compute_equal_branch_weight(
+    num_steps: int,
+    parent_indices: torch.Tensor,
+    env_indices: List[int],
+) -> torch.Tensor:
+    """Compute the original direct weight obtained by splitting equally at every branch."""
     device = parent_indices.device
     weights = torch.empty((num_steps, len(env_indices)), device=device, dtype=torch.float32)
 

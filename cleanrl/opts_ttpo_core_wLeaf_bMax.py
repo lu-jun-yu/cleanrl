@@ -1,4 +1,4 @@
-# OPTS-TTPO exp8_4 core: exp8_3 search coverage with the original mean OTRC baseline.
+# OPTS-TTPO core (wLeaf-bMax): max-backup TreeGAE, leaf-count branch weights, and parallel tree-search node selection.
 from typing import List
 
 import numpy as np
@@ -66,7 +66,56 @@ def compute_branch_weight(
     parent_indices: torch.Tensor,
     env_indices: List[int],
 ) -> torch.Tensor:
-    """Compute direct weights by splitting equally at every branch."""
+    """
+    Compute the direct training weight for every tree node.
+    A node's weight is its subtree leaf count divided by its tree's leaf count.
+
+    Args:
+        num_steps: Number of steps collected
+        parent_indices: Parent indices tensor (num_steps, num_envs)
+        env_indices: List of environment indices to compute weights for
+
+    Returns:
+        weights: (num_steps, len(env_indices)) tensor of direct branch weights
+    """
+    device = parent_indices.device
+    n_envs = len(env_indices)
+    weights = torch.empty((num_steps, n_envs), device=device, dtype=torch.float32)
+
+    for output_env_idx, env_idx in enumerate(env_indices):
+        parents = parent_indices[:num_steps, env_idx].tolist()
+        parent_nodes = {parent for parent in parents if parent >= 0}
+        leaf_counts = [0] * num_steps
+        for node in range(num_steps - 1, -1, -1):
+            if node not in parent_nodes:
+                leaf_counts[node] = 1
+            parent = parents[node]
+            if parent >= 0:
+                leaf_counts[parent] += leaf_counts[node]
+
+        tree_ids = [0] * num_steps
+        tree_leaf_counts = {}
+        for node, parent in enumerate(parents):
+            tree_id = parent if parent < 0 else tree_ids[parent]
+            tree_ids[node] = tree_id
+            if parent < 0:
+                tree_leaf_counts[tree_id] = tree_leaf_counts.get(tree_id, 0) + leaf_counts[node]
+
+        weights[:, output_env_idx] = torch.tensor(
+            [leaf_counts[node] / tree_leaf_counts[tree_ids[node]] for node in range(num_steps)],
+            device=device,
+            dtype=torch.float32,
+        )
+
+    return weights
+
+
+def compute_equal_branch_weight(
+    num_steps: int,
+    parent_indices: torch.Tensor,
+    env_indices: List[int],
+) -> torch.Tensor:
+    """Compute the original direct weight obtained by splitting equally at every branch."""
     device = parent_indices.device
     weights = torch.empty((num_steps, len(env_indices)), device=device, dtype=torch.float32)
 
@@ -100,7 +149,6 @@ def select_next_states(
     tree_indices: torch.Tensor,
     search_count: list[dict],
     max_search: int,
-    max_searched_tree_ratio: float,
     max_otrc_scores: list[dict],
     skip_init_search: list[bool],
     tree_search_state: list[dict],
@@ -110,8 +158,7 @@ def select_next_states(
 ) -> list[int]:
     """
     OPTS-TTPO node selection, vectorized over all terminated envs' trees at once (flat id = step*E + e_local).
-    Trees are registered first, then candidates are globally ranked while each
-    terminated environment can select only one of its own trees.
+    Trees are registered first, then gated in one order-independent pass; selection stays per-env.
     """
     selected = []
     n_steps = current_step + 1
@@ -211,62 +258,32 @@ def select_next_states(
             }
             max_otrc_scores[env_idx].setdefault(tid, score)
 
-    baseline_scores = [score for env_scores in max_otrc_scores for score in env_scores.values()]
-    mean_threshold = float(np.mean(baseline_scores))
+    pool = [v for d in max_otrc_scores for v in d.values()]
+    mean_threshold = float(np.mean(pool))
 
-    complete_tree_count = sum(len(states) for states in tree_search_state)
-    searched_tree_count = sum(
-        1
-        for env_idx, states in enumerate(tree_search_state)
-        for tid in states
-        if search_count[env_idx].get(tid, 0) > 0
-    )
-    max_searched_tree_count = int(max_searched_tree_ratio * complete_tree_count)
-    new_tree_budget = max_searched_tree_count - searched_tree_count
-    assert new_tree_budget >= 0, (
-        f"searched-tree ratio invariant violated: searched={searched_tree_count}, "
-        f"limit={max_searched_tree_count}, complete={complete_tree_count}"
-    )
-
-    candidates = []
     for e_local, env_idx in enumerate(terminated_envs):
+        candidates = []
         for tid in env_tree_ids_by_local[e_local]:
-            count = search_count[env_idx].get(tid, 0)
-            if count >= max_search:
+            if search_count[env_idx].get(tid, 0) >= max_search:
                 continue
             state = tree_search_state[env_idx][tid]
             if state["score"] <= mean_threshold:
                 continue
-            candidates.append((state["score"], env_idx, tid, state, count == 0))
+            candidates.append((state["score"], tid, state))
 
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    selected_by_env = {}
-    selected_new_tree_count = 0
-    for score, env_idx, tid, state, is_new_search_tree in candidates:
-        if env_idx in selected_by_env:
-            continue
-        if is_new_search_tree and selected_new_tree_count >= new_tree_budget:
-            continue
-
-        selected_by_env[env_idx] = state["step"]
-        if is_new_search_tree:
-            selected_new_tree_count += 1
-        search_count[env_idx][tid] = search_count[env_idx].get(tid, 0) + 1
-        print(
-            f"    Tree Search: env_idx={env_idx}, tree_id={tid}, "
-            f"otrc_score={score:.4f}, "
-            f"search_count={search_count[env_idx][tid]}, "
-            f"depth={state['max_pos']} / {state['n_t']}"
-        )
-
-    assert selected_new_tree_count <= new_tree_budget
-    assert len(selected_by_env) <= len(terminated_envs)
-
-    for e_local, env_idx in enumerate(terminated_envs):
-        if env_idx in selected_by_env:
-            selected.append(selected_by_env[env_idx])
-        else:
-            print(f"    New Tree: env_idx={env_idx}")
+        if not candidates:
+            print(f"    New Tree: best_otrc_score={float('-inf'):.4f}")
             selected.append(-(env_num_trees[e_local] + 1))
+            continue
+
+        score, best_tid, best_state = max(candidates, key=lambda item: item[0])
+        search_count[env_idx][best_tid] = search_count[env_idx].get(best_tid, 0) + 1
+        print(
+            f"    Tree Search: env_idx={env_idx}, tree_id={best_tid}, "
+            f"otrc_score={score:.4f}, "
+            f"search_count={search_count[env_idx][best_tid]}, "
+            f"depth={best_state['max_pos']} / {best_state['n_t']}"
+        )
+        selected.append(best_state["step"])
 
     return selected

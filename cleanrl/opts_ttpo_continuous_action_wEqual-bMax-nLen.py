@@ -16,7 +16,7 @@ import tyro
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
-from opts_ttpo_core import compute_branch_weight, compute_tree_gae, select_next_states
+from opts_ttpo_core_wEqual_bMax import compute_branch_weight, compute_tree_gae, select_next_states
 
 
 @dataclass

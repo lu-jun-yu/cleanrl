@@ -1,4 +1,4 @@
-# OPTS-TTPO exp7 core: max-backup TreeGAE, equal branch weights, and parallel tree-search node selection.
+# OPTS-TTPO core (wEqual-bMax): max-backup TreeGAE, equal branch weights, and parallel tree-search node selection.
 from typing import List
 
 import numpy as np

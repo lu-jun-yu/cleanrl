@@ -16,7 +16,7 @@ import tyro
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
-from opts_ttpo_core import compute_branch_weight, compute_tree_gae, select_next_states
+from opts_ttpo_core_wLeaf_bMean import compute_branch_weight, compute_equal_branch_weight, compute_tree_gae, select_next_states
 
 
 @dataclass
@@ -423,7 +423,7 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260802"
+    algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260814"
     if args.track:
         import wandb
 
@@ -677,7 +677,7 @@ if __name__ == "__main__":
 
         # Compute tree-weighted aggregated returns
         if episodic_return_info:
-            return_branch_weights = compute_branch_weight(
+            return_branch_weights = compute_equal_branch_weight(
                 num_steps=args.num_steps,
                 parent_indices=parent_indices,
                 env_indices=list(range(args.num_envs)),

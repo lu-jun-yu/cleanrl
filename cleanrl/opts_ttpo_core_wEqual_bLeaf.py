@@ -1,6 +1,7 @@
-# OPTS-TTPO exp8_3 core: max-backup TreeGAE, equal branch weights, and searched-tree coverage control.
+# OPTS-TTPO core (wEqual-bLeaf): leaf-weighted TreeGAE, equal branch weights, and parallel tree-search node selection.
 from typing import List
 
+import numpy as np
 import torch
 
 
@@ -18,7 +19,8 @@ def compute_tree_gae(
 ):
     """
     Compute TreeGAE advantages from terminal node back to root.
-    At a branch, the maximum child advantage is propagated backward.
+    At a branch, each child advantage is weighted by the number of leaves in
+    that child's subtree.
     Synchronizes advantages for identical state-action pairs.
 
     Args:
@@ -29,6 +31,16 @@ def compute_tree_gae(
         gamma, gae_lambda: GAE parameters
         next_value: Bootstrap value for non-terminal leaf nodes
     """
+    prefix_parents = parent_indices[: terminal_step + 1, env_idx].tolist()
+    parent_nodes = {parent for parent in prefix_parents if parent >= 0}
+    leaf_counts = [0] * (terminal_step + 1)
+    for node in range(terminal_step, -1, -1):
+        if node not in parent_nodes:
+            leaf_counts[node] = 1
+        parent = prefix_parents[node]
+        if parent >= 0:
+            leaf_counts[parent] += leaf_counts[node]
+
     current = terminal_step
 
     while True:
@@ -50,8 +62,9 @@ def compute_tree_gae(
         else:
             # Branch node
             child_advs = torch.stack([advantages[child, env_idx] for child in children])
-            max_child_adv = child_advs.max()
-            advantages[current, env_idx] = delta + gamma * gae_lambda * max_child_adv
+            child_leaf_counts = child_advs.new_tensor([leaf_counts[child] for child in children])
+            weighted_child_adv = (child_advs * child_leaf_counts).sum() / child_leaf_counts.sum()
+            advantages[current, env_idx] = delta + gamma * gae_lambda * weighted_child_adv
 
         # Move to parent (parent < 0 means root node)
         parent = parent_indices[current, env_idx].item()
@@ -99,7 +112,7 @@ def select_next_states(
     tree_indices: torch.Tensor,
     search_count: list[dict],
     max_search: int,
-    max_searched_tree_ratio: float,
+    max_otrc_scores: list[dict],
     skip_init_search: list[bool],
     tree_search_state: list[dict],
     affected_tree_ids: list[int],
@@ -108,8 +121,7 @@ def select_next_states(
 ) -> list[int]:
     """
     OPTS-TTPO node selection, vectorized over all terminated envs' trees at once (flat id = step*E + e_local).
-    Trees are registered first, then candidates are globally ranked while each
-    terminated environment can select only one of its own trees.
+    Trees are registered first, then gated in one order-independent pass; selection stays per-env.
     """
     selected = []
     n_steps = current_step + 1
@@ -207,60 +219,34 @@ def select_next_states(
                 "max_pos": int(max_pos[i].item()),
                 "n_t": int(n_t[i].item()),
             }
+            max_otrc_scores[env_idx].setdefault(tid, score)
 
-    complete_tree_count = sum(len(states) for states in tree_search_state)
-    searched_tree_count = sum(
-        1
-        for env_idx, states in enumerate(tree_search_state)
-        for tid in states
-        if search_count[env_idx].get(tid, 0) > 0
-    )
-    max_searched_tree_count = int(max_searched_tree_ratio * complete_tree_count)
-    new_tree_budget = max_searched_tree_count - searched_tree_count
-    assert new_tree_budget >= 0, (
-        f"searched-tree ratio invariant violated: searched={searched_tree_count}, "
-        f"limit={max_searched_tree_count}, complete={complete_tree_count}"
-    )
+    pool = [v for d in max_otrc_scores for v in d.values()]
+    mean_threshold = float(np.mean(pool))
 
-    candidates = []
     for e_local, env_idx in enumerate(terminated_envs):
+        candidates = []
         for tid in env_tree_ids_by_local[e_local]:
-            count = search_count[env_idx].get(tid, 0)
-            if count >= max_search:
+            if search_count[env_idx].get(tid, 0) >= max_search:
                 continue
             state = tree_search_state[env_idx][tid]
-            if state["score"] <= 0.0:
+            if state["score"] <= mean_threshold:
                 continue
-            candidates.append((state["score"], env_idx, tid, state, count == 0))
+            candidates.append((state["score"], tid, state))
 
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    selected_by_env = {}
-    selected_new_tree_count = 0
-    for score, env_idx, tid, state, is_new_search_tree in candidates:
-        if env_idx in selected_by_env:
-            continue
-        if is_new_search_tree and selected_new_tree_count >= new_tree_budget:
-            continue
-
-        selected_by_env[env_idx] = state["step"]
-        if is_new_search_tree:
-            selected_new_tree_count += 1
-        search_count[env_idx][tid] = search_count[env_idx].get(tid, 0) + 1
-        print(
-            f"    Tree Search: env_idx={env_idx}, tree_id={tid}, "
-            f"otrc_score={score:.4f}, "
-            f"search_count={search_count[env_idx][tid]}, "
-            f"depth={state['max_pos']} / {state['n_t']}"
-        )
-
-    assert selected_new_tree_count <= new_tree_budget
-    assert len(selected_by_env) <= len(terminated_envs)
-
-    for e_local, env_idx in enumerate(terminated_envs):
-        if env_idx in selected_by_env:
-            selected.append(selected_by_env[env_idx])
-        else:
-            print(f"    New Tree: env_idx={env_idx}")
+        if not candidates:
+            print(f"    New Tree: best_otrc_score={float('-inf'):.4f}")
             selected.append(-(env_num_trees[e_local] + 1))
+            continue
+
+        score, best_tid, best_state = max(candidates, key=lambda item: item[0])
+        search_count[env_idx][best_tid] = search_count[env_idx].get(best_tid, 0) + 1
+        print(
+            f"    Tree Search: env_idx={env_idx}, tree_id={best_tid}, "
+            f"otrc_score={score:.4f}, "
+            f"search_count={search_count[env_idx][best_tid]}, "
+            f"depth={best_state['max_pos']} / {best_state['n_t']}"
+        )
+        selected.append(best_state["step"])
 
     return selected

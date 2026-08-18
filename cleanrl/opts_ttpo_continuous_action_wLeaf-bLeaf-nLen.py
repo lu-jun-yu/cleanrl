@@ -16,7 +16,7 @@ import tyro
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
-from opts_ttpo_core_exp7 import compute_branch_weight, compute_tree_gae, select_next_states
+from opts_ttpo_core_wLeaf_bLeaf import compute_branch_weight, compute_equal_branch_weight, compute_tree_gae, select_next_states
 
 
 @dataclass
@@ -499,8 +499,9 @@ if __name__ == "__main__":
         next_obs[env_idx] = torch.Tensor(obs_data).to(device)
         root_states[env_idx] = [env.clone_state()]
 
-    def wagg(t, normalizer):
-        return (t * w).sum() / normalizer
+    # weighted loss aggregation; constant normalizer across minibatches
+    def wagg(t):
+        return (t * w).sum() / loss_norm
 
     for iteration in range(1, args.num_iterations + 1):
         episodic_return_info = []  # (episodic_return, tid, step, env_idx)
@@ -676,7 +677,7 @@ if __name__ == "__main__":
 
         # Compute tree-weighted aggregated returns
         if episodic_return_info:
-            return_branch_weights = compute_branch_weight(
+            return_branch_weights = compute_equal_branch_weight(
                 num_steps=args.num_steps,
                 parent_indices=parent_indices,
                 env_indices=list(range(args.num_envs)),
@@ -706,7 +707,7 @@ if __name__ == "__main__":
         print(f"Iteration {iteration}: mean_return={mean_return:.4f}, max_return={max_return:.4f}, min_return={min_return:.4f}")
 
         # Save results to JSON file
-        folder_name = f"./results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
+        folder_name = f"/data/results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
         os.makedirs(folder_name, exist_ok=True)
         safe_env_id = args.env_id.replace("/", "_")
         result_filename = f"{folder_name}/{safe_env_id}_{args.seed}.json"
@@ -732,7 +733,6 @@ if __name__ == "__main__":
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
         b_weights = branch_weights.reshape(-1)
-        loss_norm = b_weights.sum() / args.num_minibatches
 
         # OPTS_TTPO: full-batch weighted advantage normalization
         if args.norm_adv:
@@ -750,6 +750,7 @@ if __name__ == "__main__":
             for start in range(0, args.batch_size, args.minibatch_size):
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
+                loss_norm = len(mb_inds)
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
@@ -763,13 +764,12 @@ if __name__ == "__main__":
 
                 mb_advantages = b_advantages[mb_inds]
                 w = b_weights[mb_inds]
-                policy_loss_norm = len(mb_inds)
 
                 # Policy loss (weighted by branch weights)
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss_per_sample = torch.max(pg_loss1, pg_loss2)
-                pg_loss = wagg(pg_loss_per_sample, policy_loss_norm)
+                pg_loss = wagg(pg_loss_per_sample)
 
                 # Value loss (weighted by branch weights)
                 newvalue = newvalue.view(-1)
@@ -782,10 +782,10 @@ if __name__ == "__main__":
                     )
                     v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * wagg(v_loss_max, loss_norm)
+                    v_loss = 0.5 * wagg(v_loss_max)
                 else:
                     v_loss_per_sample = (newvalue - b_returns[mb_inds]) ** 2
-                    v_loss = 0.5 * wagg(v_loss_per_sample, loss_norm)
+                    v_loss = 0.5 * wagg(v_loss_per_sample)
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef

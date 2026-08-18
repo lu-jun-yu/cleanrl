@@ -414,7 +414,7 @@ if __name__ == "__main__":
         if resume_checkpoint is not None and resume_checkpoint.get("run_name")
         else f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     )
-    algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260605"
+    algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260807"
     if args.track:
         import wandb
 
@@ -706,13 +706,11 @@ if __name__ == "__main__":
         # Compute returns: returns[t] = A(s_t, a_t) + V(s_t)
         returns = advantages + values
 
-        # Compute branch_weight for all environments
+        # Compute direct branch weights for all environments
         branch_weights = compute_branch_weight(
             num_steps=args.num_steps,
             parent_indices=parent_indices,
-            state_branches=state_branches,
             env_indices=list(range(args.num_envs)),
-            root_branch_counts=root_branch_counts,
         )
 
         # Compute tree-weighted aggregated returns
@@ -727,8 +725,8 @@ if __name__ == "__main__":
                 weight_sum = 0.0
                 for ep_return, ep_step in entries:
                     w = branch_weights[ep_step, ei].item()
-                    weighted_sum += ep_return / w
-                    weight_sum += 1.0 / w
+                    weighted_sum += ep_return * w
+                    weight_sum += w
                 aggregated_returns.append(weighted_sum / weight_sum if weight_sum > 0 else 0.0)
 
             mean_return = sum(aggregated_returns) / len(aggregated_returns)
@@ -742,7 +740,7 @@ if __name__ == "__main__":
         print(f"Iteration {iteration}: mean_return={mean_return:.4f}, max_return={max_return:.4f}, min_return={min_return:.4f}")
 
         # Save results to JSON file
-        folder_name = f"./results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
+        folder_name = f"/data/results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
         os.makedirs(folder_name, exist_ok=True)
         safe_env_id = args.env_id.replace("/", "_")
         result_filename = f"{folder_name}/{safe_env_id}_{args.seed}.json"
@@ -770,10 +768,11 @@ if __name__ == "__main__":
         b_weights = branch_weights.reshape(-1)
 
         # OPTS_TTPO: full-batch weighted advantage normalization
-        b_w = 1.0 / b_weights
         if args.norm_adv:
-            adv_mean = (b_advantages * b_w).sum() / b_w.sum()
-            adv_var = ((b_advantages - adv_mean) ** 2 * b_w).sum() / (b_w.sum() - (b_w**2).sum() / b_w.sum())
+            adv_mean = (b_advantages * b_weights).sum() / b_weights.sum()
+            adv_var = ((b_advantages - adv_mean) ** 2 * b_weights).sum() / (
+                b_weights.sum() - (b_weights**2).sum() / b_weights.sum()
+            )
             b_advantages = (b_advantages - adv_mean) / (torch.sqrt(adv_var) + 1e-8)
 
         # Optimizing the policy and value network
@@ -797,15 +796,15 @@ if __name__ == "__main__":
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
                 mb_advantages = b_advantages[mb_inds]
-                w = b_w[mb_inds]
+                w = b_weights[mb_inds]
 
-                # Policy loss (weighted by branch factors)
+                # Policy loss (weighted by branch weights)
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss_per_sample = torch.max(pg_loss1, pg_loss2)
                 pg_loss = wagg(pg_loss_per_sample)
 
-                # Value loss (weighted by branch factors)
+                # Value loss (weighted by branch weights)
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
                     v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
