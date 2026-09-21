@@ -37,8 +37,6 @@ OPTS_TTPO（On-policy Parallel Tree Search + Tree Trajectory Policy Optimization
 
 tree_indices 张量记录每个节点所属的树 ID，该值等于该树根节点在 parent_indices 中的负数值。节点的 tree_id 继承规则：若自身的 parent 为负数则 tree_id 等于该负数，否则继承父节点的 tree_id。
 
-state_branches 张量记录每个节点被分支的次数，初始为 1。当 OTRC 选择从某节点分支时，该节点的 state_branches 加 1。
-
 ### 根节点管理
 
 root_states 是每个环境的列表，新根通过 insert(0, ...) 插入列表头部。parent_indices 中的负值通过 Python 负数索引映射到 root_states 列表：parent=-1 对应 root_states[-1]（最早创建的根），parent=-2 对应 root_states[-2]（第二棵树的根），依此类推。开新树时 current_parent 设为 -len(root_states)。
@@ -47,7 +45,6 @@ root_states 是每个环境的列表，新根通过 insert(0, ...) 插入列表�
 
 以下数据在每迭代开始时全部重新创建：
 
-- root_branch_counts：每个环境的字典，记录各根状态被分支的次数（即从同一根出发的一级节点数），用于计算根节点的 branch_weight。
 - search_count：每个环境的字典，记录每棵树在本迭代已被搜索的次数，达到 max_search_per_tree 时不再对该树搜索。
 - tree_max_returns：每个环境的字典，记录每棵树在本迭代的最大 episodic return，用于 OTRC 中的树跳过判断。
 - episodic_return_info：全局列表，记录本迭代所有终止 episode 的 (return, tree_id, step, env_idx) 四元组，用于计算 aggregated_returns。
@@ -60,14 +57,14 @@ env_states 是二维列表（num_steps x num_envs），保存每步执行动作�
 
 假设某环境有两棵树。树 A 最先创建，根状态存于 root_states[-1]，tree_id=-1。树 A 有一条从根出发的主路径 step 0→1→2（step 2 终止），之后 OTRC 选择从根分支，产生 step 3→4。树 B 后创建，根状态存于 root_states[-2]，tree_id=-2，有路径 step 5→6。
 
-此时 parent_indices 为 [-1, 0, 1, -1, 3, -2, 5]，tree_indices 为 [-1, -1, -1, -1, -1, -2, -2]。root_branch_counts 中 -1 的值为 2（根 A 出发了两条分支），-2 的值为 1。
+此时 parent_indices 为 [-1, 0, 1, -1, 3, -2, 5]，tree_indices 为 [-1, -1, -1, -1, -1, -2, -2]。
 
 
 ## 4. 训练流程
 
 ### 4.1 迭代初始化
 
-迭代开始时，只对上一迭代最后一步处于终止状态的环境执行 reset，未终止的环境保留 next_obs 和环境内部状态自然延续。所有环境都 clone 当前状态作为本迭代的根状态。然后重置树结构张量（current_parent 为 -1、parent_indices 为 -1、tree_indices 为 0、state_branches 为 1、advantages 为 0、next_done 为 0），并重新创建所有每迭代辅助数据（root_branch_counts、search_count、tree_max_returns、episodic_return_info）。
+迭代开始时，只对上一迭代最后一步处于终止状态的环境执行 reset，未终止的环境保留 next_obs 和环境内部状态自然延续。所有环境都 clone 当前状态作为本迭代的根状态。然后重置树结构张量（current_parent 为 -1、parent_indices 为 -1、tree_indices 为 0、advantages 为 0、next_done 为 0），并重新创建所有每迭代辅助数据（search_count、tree_max_returns、episodic_return_info）。
 
 延续的环境在第一步的 parent_indices 为 -1，因此 tree_id 也为 -1，与正常开新树的行为一致。延续 episode 的 RecordEpisodeStatistics 累计值在 wrapper 中自然保持，终止时报告完整的 episodic return。
 
@@ -77,7 +74,7 @@ env_states 是二维列表（num_steps x num_envs），保存每步执行动作�
 
 **保存观测和采样动作。** 将 next_obs 存入 obs[step]，通过 agent 采样得到 action、logprob 和 value。
 
-**记录树结构。** 将 current_parent 写入 parent_indices[step]，根据父节点值推导 tree_indices[step]。若父节点为负数（根节点），更新 root_branch_counts。然后将 current_parent 更新为当前 step。
+**记录树结构。** 将 current_parent 写入 parent_indices[step]，根据父节点值推导 tree_indices[step]。然后将 current_parent 更新为当前 step。
 
 **执行动作。** 所有环境执行 action，收集 next_obs、reward、done，保存状态快照到 env_states[step]。若 episode 终止，记录 episodic return 并更新 tree_max_returns。
 
@@ -89,7 +86,7 @@ env_states 是二维列表（num_steps x num_envs），保存每步执行动作�
 
 若 OTRC 返回负值（开新树），reset 环境，将新根插入 root_states 头部，设置 current_parent 为对应的负索引。
 
-若 OTRC 返回非负 step 索引（分支搜索），恢复到该 step 的父状态。若父状态是根则从 root_states 恢复，否则从 env_states 恢复并将该父节点的 state_branches 加 1。将 next_obs 设为被选中 step 的观测（从同一状态重新采样新动作），current_parent 设为该父节点。
+若 OTRC 返回非负 step 索引（分支搜索），恢复到该 step 的父状态。若父状态是根则从 root_states 恢复，否则从 env_states 恢复。将 next_obs 设为被选中 step 的观测（从同一状态重新采样新动作），current_parent 设为该父节点。
 
 ### 4.3 采样结束后
 
@@ -175,27 +172,27 @@ V^π(s_k) - G_k = -sum_{t=k}^{T} γ^{t-k} A^π(s_t, a_t)
 
 遍历所有树后，选择全局 OTRC 最大的分支点。只要存在任何可搜索的树（未被跳过且搜索次数未满），就一定选择分支，不检查 OTRC 值正负。仅当所有树都被跳过（搜索次数已满或 max return 超过阈值）时才开新树。
 
-### 5.3 Branch Weight Factor
+### 5.3 Branch Weight
 
 branch_weight 校正树形结构下的策略梯度，使其保持无偏。
 
-根节点的 weight 等于 root_branch_counts 中该根的分支数，即从同一根状态出发的一级节点总数。非根节点的 weight 等于父节点的 weight 乘以父节点的 state_branches 值，即从根到该节点路径上所有祖先分支数的累乘。
+直接由 parent_indices 计算，无需维护任何计数器：根节点的 weight 等于 1 除以从同一根状态出发的一级节点总数；非根节点的 weight 等于父节点的 weight 除以父节点的子节点数，即从根到该节点路径上所有祖先分支数累乘的倒数。
 
-直觉：一个节点被经过的次数越多（因为其祖先被多次分支），它在数据中出现的频率就越高，需要除以 weight 来消除重复采样的偏差。
+直觉：一个节点被经过的次数越多（因为其祖先被多次分支），它在数据中出现的频率就越高，需要乘以相应的小权重来消除重复采样的偏差。
 
 ### 5.4 Aggregated Returns
 
-每迭代结束时，按 (env_idx, tree_id) 对本迭代终止的 episode 分组。同组内各 episode 的 return 用 branch_weight 倒数加权平均，得到每组的 aggregated_return。对所有组求均值得到 mean_return。
+每迭代结束时，按 (env_idx, tree_id) 对本迭代终止的 episode 分组。同组内各 episode 的 return 用 branch_weight 加权平均，得到每组的 aggregated_return。对所有组求均值得到 mean_return。
 
 mean_return 直接赋值给 prev_mean_return，作为下一迭代 OTRC 中的树跳过阈值（return_threshold）。首次迭代时 prev_mean_return 为 None，此时所有终止 episode 直接开新树，不进行树搜索。
 
 ### 5.5 策略梯度（TTPO）
 
-PPO 的 clipped surrogate loss 和 value loss 均除以 branch_weight 后加权求和，而非简单均值：
+PPO 的 clipped surrogate loss 和 value loss 均乘以 branch_weight 加权求和，而非简单均值：
 
 ```
-pg_loss = sum(clip_loss_i / W_i) / sum(1 / W_i)
-v_loss  = sum(value_loss_i / W_i) / sum(1 / W_i)
+pg_loss = sum(clip_loss_i * w_i) / loss_norm
+v_loss  = sum(value_loss_i * w_i) / loss_norm
 ```
 
 entropy_loss 不进行 branch_weight 加权，直接取简单均值：
@@ -273,7 +270,7 @@ MuJoCo 环境 wrapper 链（从内到外）：`gym.make` → `FlattenObservation
 
 核心算法（TreeGAE、OTRC、branch_weight、aggregated_returns、加权 PPO 更新）在 Atari 和 MuJoCo 两个实现中完全一致，差异仅在于环境接口适配层：
 
-| 差异项 | Atari (`opts_ttpo_atari.py`) | MuJoCo (`opts_ttpo_continuous_action.py`) |
+| 差异项 | Atari (`opts_ttpo_atari_bMax_sticky.py`) | MuJoCo (`opts_ttpo_continuous_action_wEqual-bMax-nLen.py`) |
 |--------|------------------------------|-------------------------------------------|
 | 动作空间 | Discrete，Categorical 分布采样 | Box，Normal 分布采样（actor_mean + actor_logstd） |
 | 网络结构 | CNN（3 层 Conv2d → Linear(512)）| MLP（2 层 Linear(64) + Tanh） |

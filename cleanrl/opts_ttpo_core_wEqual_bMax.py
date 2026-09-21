@@ -1,4 +1,5 @@
 # OPTS-TTPO core (wEqual-bMax): max-backup TreeGAE, equal branch weights, and parallel tree-search node selection.
+# Shared by opts_ttpo_continuous_action_wEqual-bMax-nLen.py and opts_ttpo_atari_bMax_sticky.py.
 from typing import List
 
 import numpy as np
@@ -100,12 +101,13 @@ def select_next_states(
     tree_indices: torch.Tensor,
     search_count: list[dict],
     max_search: int,
-    max_otrc_scores: list[dict],
+    max_perf_diffs: list[dict],
     skip_init_search: list[bool],
     tree_search_state: list[dict],
     affected_tree_ids: list[int],
     gamma: float = 0.99,
     tau: float = 0.7,
+    baseline_mode: str = "mean",
 ) -> list[int]:
     """
     OPTS-TTPO node selection, vectorized over all terminated envs' trees at once (flat id = step*E + e_local).
@@ -186,31 +188,36 @@ def select_next_states(
 
         path_adv = sub_advs.reshape(-1)[path_idx].masked_fill(~path_mask, 0.0)
         path_adv[row, virtual_pos] = 0.0
-        otrc_score = torch.zeros_like(path_adv)
+        perf_diff = torch.zeros_like(path_adv)
         discounted = torch.zeros(T, device=device, dtype=dtype)
         for k in range(path_idx.shape[1] - 1, -1, -1):
             m = path_mask[:, k].to(dtype)
             discounted = (-path_adv[:, k] + gamma * discounted) * m + discounted * (1 - m)
             divisor = torch.where(path_mask[:, k], n_t - k, 1).to(dtype) ** tau
-            otrc_score[:, k] = torch.where(path_mask[:, k], discounted / divisor, torch.zeros_like(discounted))
+            perf_diff[:, k] = torch.where(path_mask[:, k], discounted / divisor, torch.zeros_like(discounted))
 
-        max_pos = torch.where(path_mask, otrc_score, neg_inf).argmax(dim=1)
-        max_otrc_score = otrc_score[row, max_pos]
+        max_pos = torch.where(path_mask, perf_diff, neg_inf).argmax(dim=1)
+        max_perf_diff = perf_diff[row, max_pos]
         best_step = path_idx[row, max_pos] // E
 
         for i, tid in enumerate(refresh_tids):
             env_idx = terminated_envs[tree_e_local[i]]
-            score = float(max_otrc_score[i].item())
+            score = float(max_perf_diff[i].item())
             tree_search_state[env_idx][tid] = {
                 "score": score,
                 "step": int(best_step[i].item()),
                 "max_pos": int(max_pos[i].item()),
                 "n_t": int(n_t[i].item()),
             }
-            max_otrc_scores[env_idx].setdefault(tid, score)
+            max_perf_diffs[env_idx].setdefault(tid, score)
 
-    pool = [v for d in max_otrc_scores for v in d.values()]
-    mean_threshold = float(np.mean(pool))
+    pool = [v for d in max_perf_diffs for v in d.values()]
+    if baseline_mode == "mean":
+        mean_threshold = float(np.mean(pool))
+    elif baseline_mode == "zero":
+        mean_threshold = 0.0
+    else:
+        raise ValueError(f"baseline_mode must be 'zero' or 'mean', got {perf_diff_baseline_mode}")
 
     for e_local, env_idx in enumerate(terminated_envs):
         candidates = []
@@ -223,7 +230,7 @@ def select_next_states(
             candidates.append((state["score"], tid, state))
 
         if not candidates:
-            print(f"    New Tree: best_otrc_score={float('-inf'):.4f}")
+            print(f"    New Tree: best_perf_diff={float('-inf'):.4f}")
             selected.append(-(env_num_trees[e_local] + 1))
             continue
 
@@ -231,7 +238,7 @@ def select_next_states(
         search_count[env_idx][best_tid] = search_count[env_idx].get(best_tid, 0) + 1
         print(
             f"    Tree Search: env_idx={env_idx}, tree_id={best_tid}, "
-            f"otrc_score={score:.4f}, "
+            f"perf_diff={score:.4f}, "
             f"search_count={search_count[env_idx][best_tid]}, "
             f"depth={best_state['max_pos']} / {best_state['n_t']}"
         )

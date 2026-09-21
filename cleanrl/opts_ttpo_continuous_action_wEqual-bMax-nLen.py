@@ -22,6 +22,7 @@ from opts_ttpo_core_wEqual_bMax import compute_branch_weight, compute_tree_gae, 
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
+    results_root: str = "/data/results"
     """the name of this experiment"""
     seed: int = 1
     """seed of the experiment"""
@@ -81,9 +82,13 @@ class Args:
     """the target KL divergence threshold"""
 
     tau: float = 0.7
-    """tau for the OTRC node selection"""
+    """tau for the performance-difference node selection"""
     max_search_per_tree: int = 1
     """maximum number of tree searches per environment per iteration"""
+    baseline: str = "mean"
+    """performance-difference gating baseline: "mean" = cross-tree mean, "zero" = 0"""
+    aggregation: str = "equal"
+    """gradient aggregation: "equal" uses branch weights; "none" is naive aggregation"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -419,11 +424,19 @@ class Agent(nn.Module):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    if args.aggregation not in {"equal", "none"}:
+        raise ValueError(f"aggregation must be 'equal' or 'none', got {args.aggregation}")
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260802"
+    if args.aggregation == "none":
+        algorithm_name = (
+            "opts_ttpo_continuous_action_wNone-bMax-nLen_"
+            f"tau{args.tau}_s{args.max_search_per_tree}_20260817"
+        )
+    else:
+        algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260802"
+    run_name = f"{args.env_id}__{algorithm_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
 
@@ -509,8 +522,8 @@ if __name__ == "__main__":
         # search count per tree (reset each iteration)
         search_count = [{} for _ in range(args.num_envs)]
 
-        # pooled mean-otrc_score stats for tree filtering (verify_scaling_variance v2)
-        max_otrc_scores = [{} for _ in range(args.num_envs)]
+        # pooled mean-perf_diff stats for tree filtering (verify_scaling_variance v2)
+        max_perf_diffs = [{} for _ in range(args.num_envs)]
         tree_search_state = [{} for _ in range(args.num_envs)]
 
         # Annealing the rate if instructed to do so.
@@ -619,15 +632,16 @@ if __name__ == "__main__":
                         tree_indices=tree_indices,
                         search_count=search_count,
                         max_search=args.max_search_per_tree,
-                        max_otrc_scores=max_otrc_scores,
+                        max_perf_diffs=max_perf_diffs,
                         skip_init_search=skip_init_search,
                         tree_search_state=tree_search_state,
                         affected_tree_ids=affected_tree_ids,
                         gamma=args.gamma,
                         tau=args.tau,
+                        baseline_mode=args.baseline,
                     )
 
-                    # OTRC selection and state restoration
+                    # performance-difference selection and state restoration
                     for i, env_idx in enumerate(terminated_envs):
                         if selected[i] < 0:
                             # Variance is stable, start a new tree
@@ -707,7 +721,7 @@ if __name__ == "__main__":
         print(f"Iteration {iteration}: mean_return={mean_return:.4f}, max_return={max_return:.4f}, min_return={min_return:.4f}")
 
         # Save results to JSON file
-        folder_name = f"/data/results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
+        folder_name = f"{args.results_root}/{args.num_envs}_{args.num_steps}/{algorithm_name}"
         os.makedirs(folder_name, exist_ok=True)
         safe_env_id = args.env_id.replace("/", "_")
         result_filename = f"{folder_name}/{safe_env_id}_{args.seed}.json"
@@ -733,6 +747,8 @@ if __name__ == "__main__":
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
         b_weights = branch_weights.reshape(-1)
+        if args.aggregation == "none":
+            b_weights = torch.ones_like(b_weights)
 
         # OPTS_TTPO: full-batch weighted advantage normalization
         if args.norm_adv:

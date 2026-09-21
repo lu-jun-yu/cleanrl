@@ -16,12 +16,18 @@ import tyro
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
-from opts_ttpo_core_wEqual_bMean import compute_branch_weight, compute_tree_gae, select_next_states
+from opts_ttpo_core_wEqual_bMean import (
+    compute_branch_weight,
+    compute_tree_gae,
+    select_next_states,
+    select_next_states_random,
+)
 
 
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
+    results_root: str = "/data/results"
     """the name of this experiment"""
     seed: int = 1
     """seed of the experiment"""
@@ -81,9 +87,13 @@ class Args:
     """the target KL divergence threshold"""
 
     tau: float = 0.7
-    """tau for the OTRC node selection"""
+    """tau for the performance-difference node selection"""
     max_search_per_tree: int = 1
     """maximum number of tree searches per environment per iteration"""
+    baseline: str = "mean"
+    """performance-difference gating baseline: "mean" = cross-tree mean, "zero" = 0"""
+    branch_selection: str = "performance_difference"
+    """branch selection: "performance_difference" or "random"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -419,11 +429,22 @@ class Agent(nn.Module):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    if args.branch_selection not in {"performance_difference", "random"}:
+        raise ValueError(
+            "branch_selection must be 'performance_difference' or 'random', "
+            f"got {args.branch_selection}"
+        )
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260817"
+    if args.branch_selection == "random":
+        algorithm_name = (
+            "random_ttpo_continuous_action_wEqual-bMean-nLen_"
+            f"s{args.max_search_per_tree}_20260920"
+        )
+    else:
+        algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260817"
+    run_name = f"{args.env_id}__{algorithm_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
 
@@ -447,6 +468,10 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
+    branch_random_generators = [
+        np.random.default_rng(np.random.SeedSequence([args.seed, 0xE4, env_idx]))
+        for env_idx in range(args.num_envs)
+    ]
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
@@ -479,7 +504,6 @@ if __name__ == "__main__":
     parent_indices = -torch.ones((args.num_steps, args.num_envs), dtype=torch.long).to(device)
     # OPTS_TTPO: Tree id per node (used when nodes from the same tree are not contiguous)
     tree_indices = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long).to(device)
-    state_branches = torch.ones((args.num_steps, args.num_envs), dtype=torch.long).to(device)
     advantages = torch.zeros((args.num_steps, args.num_envs)).to(device)
     returns = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
@@ -507,14 +531,11 @@ if __name__ == "__main__":
     for iteration in range(1, args.num_iterations + 1):
         episodic_return_info = []  # (episodic_return, tid, step, env_idx)
 
-        # OPTS_TTPO: root_branch_counts maintained incrementally
-        root_branch_counts = [defaultdict(int) for _ in range(args.num_envs)]
-
         # search count per tree (reset each iteration)
         search_count = [{} for _ in range(args.num_envs)]
 
-        # pooled mean-otrc_score stats for tree filtering (verify_scaling_variance v2)
-        max_otrc_scores = [{} for _ in range(args.num_envs)]
+        # pooled mean-perf_diff stats for tree filtering (verify_scaling_variance v2)
+        max_perf_diffs = [{} for _ in range(args.num_envs)]
         tree_search_state = [{} for _ in range(args.num_envs)]
 
         # Annealing the rate if instructed to do so.
@@ -536,7 +557,6 @@ if __name__ == "__main__":
         next_done.zero_()
 
         current_parent = [-1] * args.num_envs
-        state_branches.fill_(1)
         advantages.zero_()
         parent_indices.fill_(-1)
         tree_indices.zero_()
@@ -560,15 +580,11 @@ if __name__ == "__main__":
             rewards_list = []
             next_done_list = []
 
-            # Save parent_indices and update root_branch_counts
+            # Save tree parent and root identifiers.
             for env_idx in range(args.num_envs):
                 p = current_parent[env_idx]
                 parent_indices[step, env_idx] = p
                 tree_indices[step, env_idx] = p if p < 0 else tree_indices[p, env_idx]
-                
-                # Update root_branch_counts if this is a root node
-                if p < 0:
-                    root_branch_counts[env_idx][p] += 1
 
                 current_parent[env_idx] = step
 
@@ -620,23 +636,37 @@ if __name__ == "__main__":
 
                 if step < args.num_steps - 1:
                     affected_tree_ids = [int(tree_indices[step, env_idx].item()) for env_idx in terminated_envs]
-                    selected = select_next_states(
-                        terminated_envs=terminated_envs,
-                        current_step=step,
-                        advantages=advantages,
-                        parent_indices=parent_indices,
-                        tree_indices=tree_indices,
-                        search_count=search_count,
-                        max_search=args.max_search_per_tree,
-                        max_otrc_scores=max_otrc_scores,
-                        skip_init_search=skip_init_search,
-                        tree_search_state=tree_search_state,
-                        affected_tree_ids=affected_tree_ids,
-                        gamma=args.gamma,
-                        tau=args.tau,
-                    )
+                    if args.branch_selection == "random":
+                        selected = select_next_states_random(
+                            terminated_envs=terminated_envs,
+                            current_step=step,
+                            parent_indices=parent_indices,
+                            tree_indices=tree_indices,
+                            search_count=search_count,
+                            max_search=args.max_search_per_tree,
+                            skip_init_search=skip_init_search,
+                            affected_tree_ids=affected_tree_ids,
+                            random_generators=branch_random_generators,
+                        )
+                    else:
+                        selected = select_next_states(
+                            terminated_envs=terminated_envs,
+                            current_step=step,
+                            advantages=advantages,
+                            parent_indices=parent_indices,
+                            tree_indices=tree_indices,
+                            search_count=search_count,
+                            max_search=args.max_search_per_tree,
+                            max_perf_diffs=max_perf_diffs,
+                            skip_init_search=skip_init_search,
+                            tree_search_state=tree_search_state,
+                            affected_tree_ids=affected_tree_ids,
+                            gamma=args.gamma,
+                            tau=args.tau,
+                            baseline_mode=args.baseline,
+                        )
 
-                    # OTRC selection and state restoration
+                    # performance-difference selection and state restoration
                     for i, env_idx in enumerate(terminated_envs):
                         if selected[i] < 0:
                             # Variance is stable, start a new tree
@@ -651,7 +681,6 @@ if __name__ == "__main__":
                                 envs[env_idx].restore_state(root_states[env_idx][parent])
                             else:
                                 envs[env_idx].restore_state(env_states[parent][env_idx])
-                                state_branches[parent, env_idx] += 1
                             next_obs[env_idx] = obs[selected[i], env_idx]
                             current_parent[env_idx] = parent
 
@@ -678,13 +707,11 @@ if __name__ == "__main__":
         # Compute returns: returns[t] = A(s_t, a_t) + V(s_t)
         returns = advantages + values
 
-        # Compute branch_weight for all environments
+        # Compute direct branch weights for all environments
         branch_weights = compute_branch_weight(
             num_steps=args.num_steps,
             parent_indices=parent_indices,
-            state_branches=state_branches,
             env_indices=list(range(args.num_envs)),
-            root_branch_counts=root_branch_counts,
         )
 
         # Compute tree-weighted aggregated returns
@@ -699,8 +726,8 @@ if __name__ == "__main__":
                 weight_sum = 0.0
                 for ep_return, ep_step in entries:
                     w = branch_weights[ep_step, ei].item()
-                    weighted_sum += ep_return / w
-                    weight_sum += 1.0 / w
+                    weighted_sum += ep_return * w
+                    weight_sum += w
                 aggregated_returns.append(weighted_sum / weight_sum if weight_sum > 0 else 0.0)
 
             mean_return = sum(aggregated_returns) / len(aggregated_returns)
@@ -714,7 +741,7 @@ if __name__ == "__main__":
         print(f"Iteration {iteration}: mean_return={mean_return:.4f}, max_return={max_return:.4f}, min_return={min_return:.4f}")
 
         # Save results to JSON file
-        folder_name = f"/data/results/{args.num_envs}_{args.num_steps}/{algorithm_name}"
+        folder_name = f"{args.results_root}/{args.num_envs}_{args.num_steps}/{algorithm_name}"
         os.makedirs(folder_name, exist_ok=True)
         safe_env_id = args.env_id.replace("/", "_")
         result_filename = f"{folder_name}/{safe_env_id}_{args.seed}.json"
@@ -742,10 +769,11 @@ if __name__ == "__main__":
         b_weights = branch_weights.reshape(-1)
 
         # OPTS_TTPO: full-batch weighted advantage normalization
-        b_w = 1.0 / b_weights
         if args.norm_adv:
-            adv_mean = (b_advantages * b_w).sum() / b_w.sum()
-            adv_var = ((b_advantages - adv_mean) ** 2 * b_w).sum() / (b_w.sum() - (b_w**2).sum() / b_w.sum())
+            adv_mean = (b_advantages * b_weights).sum() / b_weights.sum()
+            adv_var = ((b_advantages - adv_mean) ** 2 * b_weights).sum() / (
+                b_weights.sum() - (b_weights**2).sum() / b_weights.sum()
+            )
             b_advantages = (b_advantages - adv_mean) / (torch.sqrt(adv_var) + 1e-8)
 
         # Optimizing the policy and value network
@@ -769,15 +797,15 @@ if __name__ == "__main__":
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
                 mb_advantages = b_advantages[mb_inds]
-                w = b_w[mb_inds]
+                w = b_weights[mb_inds]
 
-                # Policy loss (weighted by branch factors)
+                # Policy loss (weighted by branch weights)
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss_per_sample = torch.max(pg_loss1, pg_loss2)
                 pg_loss = wagg(pg_loss_per_sample)
 
-                # Value loss (weighted by branch factors)
+                # Value loss (weighted by branch weights)
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
                     v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
