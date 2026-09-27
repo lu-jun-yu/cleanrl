@@ -92,9 +92,9 @@ class Args:
     target_kl: float = None
     """the target KL divergence threshold"""
 
-    xi: float = 0.7
+    xi: float = 0.6
     """length-penalty exponent for performance-difference node selection"""
-    max_search_per_tree: int = 4
+    max_search_per_tree: int = 1
     """maximum number of tree searches per environment per iteration"""
     baseline: str = "mean"
     """performance-difference gating baseline: "mean" = cross-tree mean, "zero" = 0"""

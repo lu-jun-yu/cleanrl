@@ -106,7 +106,7 @@ def select_next_states(
     tree_search_state: list[dict],
     affected_tree_ids: list[int],
     gamma: float = 0.99,
-    xi: float = 0.7,
+    xi: float = 0.6,
     baseline_mode: str = "mean",
 ) -> list[int]:
     """
