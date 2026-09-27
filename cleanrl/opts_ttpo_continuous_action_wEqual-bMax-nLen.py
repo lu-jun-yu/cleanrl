@@ -81,8 +81,8 @@ class Args:
     target_kl: float = None
     """the target KL divergence threshold"""
 
-    tau: float = 0.7
-    """tau for the performance-difference node selection"""
+    xi: float = 0.7
+    """length-penalty exponent for performance-difference node selection"""
     max_search_per_tree: int = 1
     """maximum number of tree searches per environment per iteration"""
     baseline: str = "mean"
@@ -424,6 +424,8 @@ class Agent(nn.Module):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    if args.xi < 0:
+        raise ValueError(f"xi must be nonnegative, got {args.xi}")
     if args.aggregation not in {"equal", "none"}:
         raise ValueError(f"aggregation must be 'equal' or 'none', got {args.aggregation}")
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -432,10 +434,10 @@ if __name__ == "__main__":
     if args.aggregation == "none":
         algorithm_name = (
             "opts_ttpo_continuous_action_wNone-bMax-nLen_"
-            f"tau{args.tau}_s{args.max_search_per_tree}_20260817"
+            f"xi{args.xi}_s{args.max_search_per_tree}_20260817"
         )
     else:
-        algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260802"
+        algorithm_name = f"{args.exp_name}_xi{args.xi}_s{args.max_search_per_tree}_20260802"
     run_name = f"{args.env_id}__{algorithm_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
@@ -637,7 +639,7 @@ if __name__ == "__main__":
                         tree_search_state=tree_search_state,
                         affected_tree_ids=affected_tree_ids,
                         gamma=args.gamma,
-                        tau=args.tau,
+                        xi=args.xi,
                         baseline_mode=args.baseline,
                     )
 
@@ -678,7 +680,6 @@ if __name__ == "__main__":
                     gae_lambda=args.gae_lambda,
                     next_value=next_value[env_idx].item(),
                 )
-
         # Compute returns: returns[t] = A(s_t, a_t) + V(s_t)
         returns = advantages + values
 

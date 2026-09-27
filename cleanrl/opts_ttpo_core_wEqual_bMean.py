@@ -168,13 +168,15 @@ def select_next_states(
     tree_search_state: list[dict],
     affected_tree_ids: list[int],
     gamma: float = 0.99,
-    tau: float = 0.7,
+    xi: float = 0.7,
     baseline_mode: str = "mean",
 ) -> list[int]:
     """
     OPTS-TTPO node selection, vectorized over all terminated envs' trees at once (flat id = step*E + e_local).
     Trees are registered first, then gated in one order-independent pass; selection stays per-env.
     """
+    if xi < 0:
+        raise ValueError(f"xi must be nonnegative, got {xi}")
     selected = []
     n_steps = current_step + 1
     device = advantages.device
@@ -255,7 +257,7 @@ def select_next_states(
         for k in range(path_idx.shape[1] - 1, -1, -1):
             m = path_mask[:, k].to(dtype)
             discounted = (-path_adv[:, k] + gamma * discounted) * m + discounted * (1 - m)
-            divisor = torch.where(path_mask[:, k], n_t - k, 1).to(dtype) ** tau
+            divisor = torch.where(path_mask[:, k], n_t - k, 1).to(dtype) ** xi
             perf_diff[:, k] = torch.where(path_mask[:, k], discounted / divisor, torch.zeros_like(discounted))
 
         max_pos = torch.where(path_mask, perf_diff, neg_inf).argmax(dim=1)

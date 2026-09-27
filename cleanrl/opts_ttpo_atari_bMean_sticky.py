@@ -92,8 +92,8 @@ class Args:
     target_kl: float = None
     """the target KL divergence threshold"""
 
-    tau: float = 0.7
-    """tau for the performance-difference node selection"""
+    xi: float = 0.7
+    """length-penalty exponent for performance-difference node selection"""
     max_search_per_tree: int = 4
     """maximum number of tree searches per environment per iteration"""
     baseline: str = "mean"
@@ -397,6 +397,8 @@ class Agent(nn.Module):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    if args.xi < 0:
+        raise ValueError(f"xi must be nonnegative, got {args.xi}")
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
@@ -416,7 +418,7 @@ if __name__ == "__main__":
         if resume_checkpoint is not None and resume_checkpoint.get("run_name")
         else f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     )
-    algorithm_name = f"{args.exp_name}_tau{args.tau}_s{args.max_search_per_tree}_20260820"
+    algorithm_name = f"{args.exp_name}_xi{args.xi}_s{args.max_search_per_tree}_20260820"
     if args.track:
         import wandb
 
@@ -494,14 +496,15 @@ if __name__ == "__main__":
             next_obs[env_idx] = torch.Tensor(obs_data).to(device)
             root_states[env_idx] = [env.clone_state()]
     else:
+        resume_args = resume_checkpoint["args"]
         required_match_keys = [
             "env_id", "seed", "num_envs", "num_steps", "num_minibatches",
-            "gamma", "gae_lambda", "tau", "max_search_per_tree",
+            "gamma", "gae_lambda", "xi", "max_search_per_tree",
         ]
-        mismatched = [k for k in required_match_keys if resume_checkpoint["args"].get(k) != getattr(args, k)]
+        mismatched = [k for k in required_match_keys if resume_args.get(k) != getattr(args, k)]
         if mismatched:
             details = ", ".join(
-                f"{k}: checkpoint={resume_checkpoint['args'].get(k)} current={getattr(args, k)}" for k in mismatched
+                f"{k}: checkpoint={resume_args.get(k)} current={getattr(args, k)}" for k in mismatched
             )
             raise ValueError(f"resume checkpoint args must match current run; mismatched -> {details}")
         agent.load_state_dict(resume_checkpoint["model_state_dict"])
@@ -654,7 +657,7 @@ if __name__ == "__main__":
                         tree_search_state=tree_search_state,
                         affected_tree_ids=affected_tree_ids,
                         gamma=args.gamma,
-                        tau=args.tau,
+                        xi=args.xi,
                         baseline_mode=args.baseline,
                     )
 
