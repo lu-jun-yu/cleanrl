@@ -17,6 +17,7 @@ def compute_tree_gae(
     gamma: float,
     gae_lambda: float,
     next_value: float = 0.0,
+    timeout_bootstrap_values: torch.Tensor | None = None,
 ):
     """
     Compute TreeGAE advantages from terminal node back to root.
@@ -41,7 +42,10 @@ def compute_tree_gae(
         # V_next uses the child node's stored value (same parent-state index semantics).
         children = (parent_indices[: terminal_step + 1, env_idx] == current).nonzero(as_tuple=True)[0].tolist()
         if len(children) == 0:
-            V_next = 0.0 if dones[current, env_idx] else next_value
+            if dones[current, env_idx]:
+                V_next = timeout_bootstrap_values[current, env_idx] if timeout_bootstrap_values is not None else 0.0
+            else:
+                V_next = next_value
         else:
             V_next = values[children[0], env_idx]
 
@@ -281,7 +285,7 @@ def select_next_states(
     elif baseline_mode == "zero":
         mean_threshold = 0.0
     else:
-        raise ValueError(f"baseline_mode must be 'zero' or 'mean', got {perf_diff_baseline_mode}")
+        raise ValueError(f"baseline_mode must be 'zero' or 'mean', got {baseline_mode}")
 
     for e_local, env_idx in enumerate(terminated_envs):
         candidates = []

@@ -18,6 +18,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 @dataclass
 class Args:
+    timeout_bootstrap: bool = False  # Experimental intervention; original default is value=0
+    checkpoint_every: int = 0  # Optional experiment instrumentation; 0 disables it
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
     seed: int = 1
@@ -156,6 +158,16 @@ class Agent(nn.Module):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    if args.checkpoint_every < 0:
+        raise ValueError("checkpoint_every must be nonnegative")
+    if args.checkpoint_every:
+        # Checkpoint implementation lives with the experiment utilities.
+        if not os.environ.get("AXAP_JOB_DIR"):
+            raise ValueError("Set AXAP_JOB_DIR for checkpoints, or use experiments/worker.py")
+        from pathlib import Path
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "experiments"))
+        from axap_checkpoint import save_checkpoint
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
@@ -212,9 +224,11 @@ if __name__ == "__main__":
     next_done = torch.zeros(args.num_envs).to(device)
 
     for iteration in range(1, args.num_iterations + 1):
+        axap_truncations = 0
+        axap_bootstraps = 0
         # Initialize episodic_returns for this iteration
         episodic_returns = []
-        
+
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
@@ -236,7 +250,24 @@ if __name__ == "__main__":
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
             next_done = np.logical_or(terminations, truncations)
+            axap_truncations += int(np.logical_and(truncations, np.logical_not(terminations)).sum())
             rewards[step] = torch.tensor(reward).to(device).view(-1)
+            if args.timeout_bootstrap:
+                timeout_indices = np.flatnonzero(np.logical_and(truncations, np.logical_not(terminations)))
+                if len(timeout_indices):
+                    axap_bootstraps += len(timeout_indices)
+                    final_obs = infos.get("final_observation")
+                    if final_obs is None:
+                        raise RuntimeError("Auto-reset vector environment omitted final_observation for time limit")
+                    timeout_observations = []
+                    for timeout_idx in timeout_indices:
+                        terminal_obs = final_obs[int(timeout_idx)]
+                        if terminal_obs is None:
+                            raise RuntimeError(f"No final_observation for timeout env {timeout_idx}")
+                        timeout_observations.append(terminal_obs)
+                    with torch.no_grad():
+                        terminal_values = agent.get_value(torch.as_tensor(np.stack(timeout_observations), dtype=torch.float32, device=device)).reshape(-1)
+                    rewards[step, timeout_indices.tolist()] += args.gamma * terminal_values
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
             if "final_info" in infos:
@@ -363,7 +394,10 @@ if __name__ == "__main__":
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
+        print(f"AXAP_TIMEOUT_COUNTS iteration={iteration} truncations={axap_truncations} bootstrapped={axap_bootstraps}", flush=True)
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+        if args.checkpoint_every and (iteration % args.checkpoint_every == 0 or iteration == args.num_iterations):
+            save_checkpoint(agent, optimizer, args, iteration, global_step, envs)
 
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"

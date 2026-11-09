@@ -26,6 +26,8 @@ from opts_ttpo_core_wEqual_bMean import (
 
 @dataclass
 class Args:
+    timeout_bootstrap: bool = False  # Experimental intervention; original default is value=0
+    checkpoint_every: int = 0  # Optional experiment instrumentation; 0 disables it
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     results_root: str = "/data/results"
     """the name of this experiment"""
@@ -429,6 +431,16 @@ class Agent(nn.Module):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    if args.checkpoint_every < 0:
+        raise ValueError("checkpoint_every must be nonnegative")
+    if args.checkpoint_every:
+        # Checkpoint implementation lives with the experiment utilities.
+        if not os.environ.get("AXAP_JOB_DIR"):
+            raise ValueError("Set AXAP_JOB_DIR for checkpoints, or use experiments/worker.py")
+        from pathlib import Path
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "experiments"))
+        from axap_checkpoint import save_checkpoint
     if args.xi < 0:
         raise ValueError(f"xi must be nonnegative, got {args.xi}")
     if args.branch_selection not in {"performance_difference", "random"}:
@@ -499,6 +511,7 @@ if __name__ == "__main__":
     actions = torch.zeros((args.num_steps, args.num_envs) + envs[0].action_space.shape).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    timeout_bootstrap_values = torch.zeros_like(rewards)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
@@ -531,6 +544,8 @@ if __name__ == "__main__":
         return (t * w).sum() / loss_norm
 
     for iteration in range(1, args.num_iterations + 1):
+        axap_truncations = 0
+        axap_bootstraps = 0
         episodic_return_info = []  # (episodic_return, tid, step, env_idx)
 
         # search count per tree (reset each iteration)
@@ -560,6 +575,7 @@ if __name__ == "__main__":
 
         current_parent = [-1] * args.num_envs
         advantages.zero_()
+        timeout_bootstrap_values.zero_()
         parent_indices.fill_(-1)
         tree_indices.zero_()
         
@@ -595,6 +611,15 @@ if __name__ == "__main__":
                 next_obs_list.append(next_o)
                 rewards_list.append(r)
                 next_done_list.append(terminated or truncated)
+                if truncated and not terminated:
+                    axap_truncations += 1
+                if args.timeout_bootstrap and truncated and not terminated:
+                    axap_bootstraps += 1
+                    # Unlike PPO SyncVectorEnv, TTPO steps one env and receives the
+                    # actual final normalized observation before explicitly resetting.
+                    with torch.no_grad():
+                        final_value = agent.get_value(torch.as_tensor(next_o, dtype=torch.float32, device=device).unsqueeze(0))
+                    timeout_bootstrap_values[step, env_idx] = final_value.item()
 
                 # Save state snapshot (after action)
                 env_states[step][env_idx] = env.clone_state()
@@ -634,6 +659,7 @@ if __name__ == "__main__":
                         advantages=advantages,
                         gamma=args.gamma,
                         gae_lambda=args.gae_lambda,
+                        timeout_bootstrap_values=timeout_bootstrap_values,
                     )
 
                 if step < args.num_steps - 1:
@@ -703,6 +729,7 @@ if __name__ == "__main__":
                     advantages=advantages,
                     gamma=args.gamma,
                     gae_lambda=args.gae_lambda,
+                    timeout_bootstrap_values=timeout_bootstrap_values,
                     next_value=next_value[env_idx].item(),
                 )
 
@@ -849,7 +876,10 @@ if __name__ == "__main__":
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         print()
+        print(f"AXAP_TIMEOUT_COUNTS iteration={iteration} truncations={axap_truncations} bootstrapped={axap_bootstraps}", flush=True)
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+        if args.checkpoint_every and (iteration % args.checkpoint_every == 0 or iteration == args.num_iterations):
+            save_checkpoint(agent, optimizer, args, iteration, global_step, envs)
 
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
